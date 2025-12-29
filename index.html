@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>SpacePass — ISS Tracker (Red Track & Minimal UI)</title>
+
+<!-- Leaflet CSS -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+
+<style>
+:root{
+  --bg:#060618;
+  --panel:#0b1020;
+  --accent:#00e6ff;
+  --muted:#9aa7b2;
+  --danger:#ff3b3b;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{
+  font-family:Inter,system-ui,Segoe UI,Roboto,Arial;
+  background:
+    radial-gradient(1200px 600px at 10% 10%, rgba(0,230,255,0.03), transparent 5%),
+    radial-gradient(900px 400px at 90% 90%, rgba(0,120,255,0.02), transparent 10%),
+    var(--bg);
+  color:#eaf6ff;
+  display:flex;
+  gap:18px;
+  padding:18px;
+  align-items:stretch;
+  min-height:100vh;
+}
+
+/* Left panel (aligned grid) */
+.panel{
+  width:380px; max-width:420px; min-width:280px;
+  border-radius:12px;
+  padding:16px;
+  background:linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0.01));
+  border:1px solid rgba(0,230,255,0.06);
+  display:flex;flex-direction:column;gap:12px; overflow:auto;
+  box-shadow:0 8px 30px rgba(0,0,0,0.6);
+}
+
+/* Custom scrollbar */
+.panel::-webkit-scrollbar{ width:8px }
+.panel::-webkit-scrollbar-track{ background: rgba(255,255,255,0.02); border-radius:8px }
+.panel::-webkit-scrollbar-thumb{
+  background: linear-gradient(180deg, rgba(0,230,255,0.9), rgba(0,120,255,0.8));
+  border-radius:8px; border:2px solid rgba(0,0,0,0.25);
+}
+.panel{ scrollbar-width: thin; scrollbar-color: rgba(0,200,255,0.95) rgba(255,255,255,0.02) }
+
+/* Header */
+.header{ display:flex; gap:12px; align-items:center }
+.logo{ width:48px;height:48px;border-radius:10px; display:flex;align-items:center;justify-content:center; background:linear-gradient(135deg,#031022,#02243a); border:1px solid rgba(0,230,255,0.12) }
+h1{ margin:0; font-size:16px; color:var(--accent) }
+.lead{ margin:0; color:var(--muted); font-size:13px }
+
+/* Position grid: 2-column aligned */
+.pos-grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:10px;
+  align-items:start;
+}
+.stat{
+  background: rgba(255,255,255,0.02);
+  padding:10px;
+  border-radius:8px;
+  border:1px solid rgba(255,255,255,0.02);
+}
+.stat .label{ color:var(--muted); font-size:13px; }
+.stat .value{ color:#fff; font-weight:700; font-size:16px; margin-top:6px; }
+
+/* Orbit row */
+.orbit-row{ display:flex; gap:8px; align-items:center; justify-content:space-between; }
+
+/* Next pass card */
+.pass-card{ background: rgba(0,0,0,0.06); padding:10px; border-radius:8px; border:1px solid rgba(255,255,255,0.02) }
+.pass-row{ display:flex; justify-content:space-between; gap:8px; padding:6px 0; align-items:center; }
+.pass-label{ color:var(--muted); font-size:13px }
+.pass-value{ color:#fff; font-weight:700; text-align:right }
+
+/* Small UI */
+.small-muted{ color:var(--muted); font-size:13px }
+.btn{ background:transparent; border:1px solid rgba(255,255,255,0.04); padding:8px 10px; border-radius:8px; color:#e8fbff; cursor:pointer }
+.btn.primary{ background:linear-gradient(90deg,var(--accent),#0078ff); color:#001; border:none }
+
+/* Map */
+.map-wrap{ flex:1; border-radius:12px; overflow:hidden; display:flex; flex-direction:column; border:1px solid rgba(255,255,255,0.03) }
+#map{ flex:1; min-height:420px }
+.map-footer{ padding:10px 14px; display:flex; justify-content:space-between; align-items:center; gap:12px; background:rgba(0,0,0,0.08); border-top:1px solid rgba(255,255,255,0.02) }
+
+/* responsive */
+@media (max-width:900px){
+  body{ flex-direction:column; padding:12px }
+  .panel{ width:100%; max-height:45vh }
+  .map-wrap{ width:100%; min-height:320px }
+}
+</style>
+</head>
+<body>
+
+<aside class="panel" aria-label="Controls (minimal)">
+  <div class="header">
+    <div class="logo" title="SpacePass">
+      <svg width="36" height="36" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+        <rect x="6" y="18" width="52" height="28" rx="6" fill="#001a21"/>
+        <path d="M10 24h44" stroke="#00e6ff" stroke-width="1.2" stroke-linecap="round"/>
+        <circle cx="32" cy="32" r="4" fill="#00e6ff"/>
+      </svg>
+    </div>
+    <div>
+      <h1>SpacePass — ISS</h1>
+      <p class="lead">Posisi & lintasan — API → TLE → fallback</p>
+    </div>
+  </div>
+
+  <div><div class="small-muted">Sumber:</div><div id="sourceStatus" class="small-muted">mengecek…</div></div>
+
+  <div class="pos-grid" aria-hidden="false">
+    <div class="stat">
+      <div class="label">Latitude</div>
+      <div class="value" id="lat">—</div>
+    </div>
+    <div class="stat">
+      <div class="label">Longitude</div>
+      <div class="value" id="lon">—</div>
+    </div>
+
+    <div class="stat">
+      <div class="label">Altitude (km)</div>
+      <div class="value" id="alt">—</div>
+    </div>
+    <div class="stat">
+      <div class="label">Velocity (km/h)</div>
+      <div class="value" id="spd">—</div>
+    </div>
+
+    <div class="stat">
+      <div class="label">Ground speed</div>
+      <div class="value" id="groundSpeed">—</div>
+    </div>
+    <div class="stat">
+      <div class="label">Typical alt</div>
+      <div class="value" id="typAlt">~408 km</div>
+    </div>
+  </div>
+
+  <div class="pass-card">
+    <div style="font-size:13px;color:var(--muted);margin-bottom:6px">Lewat (Sebelumnya / Sekarang / Berikutnya)</div>
+
+    <div class="pass-row">
+      <div class="pass-label">Sebelumnya</div>
+      <div class="pass-value" id="prevPlace">—</div>
+    </div>
+
+    <div class="pass-row">
+      <div class="pass-label">Sekarang</div>
+      <div class="pass-value" id="nowPlace">—</div>
+    </div>
+
+    <div class="pass-row">
+      <div class="pass-label">Berikutnya</div>
+      <div class="pass-value" id="nextPlace">—</div>
+    </div>
+  </div>
+
+  <div style="display:flex;gap:8px;align-items:center">
+    <button id="centerBtn" class="btn">Center ke ISS</button>
+    <button id="clearTrack" class="btn">Clear Track</button>
+  </div>
+
+  <div class="small-muted">Titik terekam: <span id="pointsCount">0</span></div>
+</aside>
+
+<main class="map-wrap">
+  <div id="map"></div>
+  <div class="map-footer">
+    <div id="mapStatus" class="small-muted">memuat peta…</div>
+    <div class="small-muted">Polling tiap 5s • fallback: TLE/local</div>
+  </div>
+</main>
+
+<!-- Leaflet & satellite.js -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/satellite.js/dist/satellite.min.js"></script>
+
+<script>
+/*
+  SpacePass — combined index.html per request
+  - Prefer API (wheretheiss.at), fallback to TLE (celestrak/iss.txt), then sample
+  - Red polyline & red marker
+  - Show Position grid aligned, Ground speed computed
+  - Next/Prev/Now place names via reverse geocoding (Nominatim) if available
+  - No log download; no visible crew/TLE UI
+*/
+
+const POLL_MS = 5000;
+const SAMPLE_POSITIONS = [
+  {latitude: 0.0, longitude: 0.0, altitude: 408, velocity: 27600, timestamp: Math.floor(Date.now()/1000)-30},
+  {latitude: 0.2, longitude: 0.8, altitude: 407.9, velocity: 27605, timestamp: Math.floor(Date.now()/1000)}
+];
+
+let USING = { tilesLocal:false, posAPI:false, tleLoaded:false, tleUsed:false };
+
+// UI refs
+const latEl = document.getElementById('lat');
+const lonEl = document.getElementById('lon');
+const altEl = document.getElementById('alt');
+const spdEl = document.getElementById('spd');
+const groundEl = document.getElementById('groundSpeed');
+const typAltEl = document.getElementById('typAlt');
+const prevPlaceEl = document.getElementById('prevPlace');
+const nowPlaceEl = document.getElementById('nowPlace');
+const nextPlaceEl = document.getElementById('nextPlace');
+const sourceStatus = document.getElementById('sourceStatus');
+const mapStatus = document.getElementById('mapStatus');
+const pointsCountEl = document.getElementById('pointsCount');
+const centerBtn = document.getElementById('centerBtn');
+const clearTrackBtn = document.getElementById('clearTrack');
+
+// Map init
+const map = L.map('map', { zoomControl:true }).setView([0,0], 2);
+
+async function testLocalTile(){
+  try{
+    const r = await fetch('tiles/2/1/1.png', { method:'HEAD' }).catch(()=>null);
+    return r && r.ok;
+  }catch(e){ return false; }
+}
+
+async function initTiles(){
+  const ok = await testLocalTile();
+  USING.tilesLocal = !!ok;
+  if(ok){
+    L.tileLayer('tiles/{z}/{x}/{y}.png', { minZoom:0, maxZoom:6, attribution:'Offline tiles' }).addTo(map);
+    mapStatus.textContent = 'Menggunakan tiles lokal.';
+  } else {
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:19, attribution:'&copy; OSM' }).addTo(map);
+    mapStatus.textContent = 'Menggunakan tiles online.';
+  }
+  updateSourceLabel();
+}
+initTiles();
+
+// red marker & polyline
+const redIcon = L.divIcon({
+  html: `<svg width="44" height="44" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g><circle cx="32" cy="32" r="18" fill="${'#ff3b3b'}" opacity="0.12"/><path d="M20 32h24" stroke="${'#ff3b3b'}" stroke-width="2.2" stroke-linecap="round"/></g></svg>`,
+  className:'', iconSize:[44,44], iconAnchor:[22,22]
+});
+const issMarker = L.marker([0,0], { icon: redIcon }).addTo(map);
+const trackLine = L.polyline([], { color: '#ff3b3b', weight:3.6, opacity:0.95 }).addTo(map);
+let trackPoints = []; // {latitude,longitude,altitude,velocity,timestamp,source}
+
+// storage key
+const TRACK_KEY = 'spacepass_iss_track_v4';
+function loadTrack(){ try{ const raw = localStorage.getItem(TRACK_KEY); if(raw){ trackPoints = JSON.parse(raw); trackLine.setLatLngs(trackPoints.map(p=>[p.latitude,p.longitude])); pointsCountEl.textContent = trackPoints.length; } }catch(e){ console.warn(e) } }
+function saveTrack(){ try{ localStorage.setItem(TRACK_KEY, JSON.stringify(trackPoints)); }catch(e){} }
+loadTrack();
+
+// TLE auto-load (silent)
+let tleLines = null;
+async function tryAutoTLE(){
+  try{
+    const resp = await fetch('celestrak/iss.txt').catch(()=>null);
+    if(resp && resp.ok){
+      const txt = await resp.text();
+      const lines = txt.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+      let tle = null;
+      if(lines.length >= 3) tle = [lines[1], lines[2]];
+      else if(lines.length >= 2) tle = [lines[0], lines[1]];
+      if(tle){ tleLines = tle; USING.tleLoaded = true; USING.tleUsed = !!(window.satellite && tleLines); }
+    }
+  }catch(e){}
+  updateSourceLabel();
+}
+tryAutoTLE();
+
+// helpers
+function nowUnix(){ return Math.floor(Date.now()/1000); }
+function haversine(lat1,lon1,lat2,lon2){
+  const R=6371; const toRad=Math.PI/180;
+  const dLat=(lat2-lat1)*toRad, dLon=(lon2-lon1)*toRad;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*toRad)*Math.cos(lat2*toRad)*Math.sin(dLon/2)**2;
+  const c = 2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R*c;
+}
+
+// compute pos from TLE if satlib present
+function posFromTLE(){
+  try{
+    if(!(tleLines && window.satellite)) return null;
+    const satrec = satellite.twoline2satrec(tleLines[0], tleLines[1]);
+    const now = new Date();
+    const eci = satellite.propagate(satrec, now);
+    if(!eci.position) return null;
+    const gmst = satellite.gstime(now);
+    const geo = satellite.eciToGeodetic(eci.position, gmst);
+    const lat = satellite.degreesLat(geo.latitude);
+    const lon = satellite.degreesLong(geo.longitude);
+    const alt = geo.height;
+    return { latitude: lat, longitude: lon, altitude: alt, velocity: null, timestamp: Math.floor(now/1000), source: 'TLE' };
+  }catch(e){ console.warn('TLE->pos err', e); return null; }
+}
+
+// fetch API
+async function fetchFromAPI(){
+  try{
+    const r = await fetch('https://api.wheretheiss.at/v1/satellites/25544');
+    if(!r.ok) throw new Error('api fail');
+    const j = await r.json();
+    return {
+      latitude: Number(j.latitude),
+      longitude: Number(j.longitude),
+      altitude: j.altitude !== undefined ? Number(j.altitude) : null,
+      velocity: j.velocity !== undefined ? Number(j.velocity) : null,
+      timestamp: Number(j.timestamp) || nowUnix(),
+      source: 'API'
+    };
+  }catch(e){
+    return null;
+  }
+}
+
+// fallback sample
+function samplePos(){
+  const p = SAMPLE_POSITIONS[Math.floor(Math.random()*SAMPLE_POSITIONS.length)];
+  return {...p, timestamp: nowUnix(), source:'sample'};
+}
+
+// main getter: prefer API, then TLE, then sample
+async function getPosition(){
+  // 1) API
+  const api = await fetchFromAPI();
+  if(api){ USING.posAPI = true; updateSourceLabel(); return api; }
+  USING.posAPI = false;
+  // 2) TLE (if loaded and library)
+  if(tleLines && window.satellite){
+    const tpos = posFromTLE();
+    if(tpos){ updateSourceLabel(); return {...tpos, source:'TLE'} }
+  }
+  // 3) sample
+  updateSourceLabel();
+  return samplePos();
+}
+
+// add record
+function record(pos){
+  const p = {
+    latitude: pos.latitude, longitude: pos.longitude,
+    altitude: pos.altitude !== undefined ? pos.altitude : null,
+    velocity: pos.velocity !== undefined ? pos.velocity : null,
+    timestamp: pos.timestamp || nowUnix(),
+    source: pos.source || (USING.posAPI?'API':(USING.tleUsed?'TLE':'sample'))
+  };
+  trackPoints.push(p);
+  if(trackPoints.length > 2000) trackPoints.shift();
+  trackLine.setLatLngs(trackPoints.map(pt=>[pt.latitude,pt.longitude]));
+  issMarker.setLatLng([p.latitude,p.longitude]);
+  pointsCountEl.textContent = trackPoints.length;
+  saveTrack();
+  // update position UI
+  latEl.textContent = p.latitude.toFixed(5);
+  lonEl.textContent = p.longitude.toFixed(5);
+  altEl.textContent = p.altitude !== null ? p.altitude.toFixed(2) : '—';
+  spdEl.textContent = p.velocity !== null ? p.velocity.toFixed(2) : '—';
+  typAltEl.textContent = p.altitude ? Math.round(p.altitude) + ' km' : '~408 km';
+  // ground speed: compute between last two
+  if(trackPoints.length >= 2){
+    const a = trackPoints[trackPoints.length-2], b = trackPoints[trackPoints.length-1];
+    const d = haversine(a.latitude,a.longitude,b.latitude,b.longitude);
+    const dt = b.timestamp - a.timestamp;
+    const kmh = (dt>0) ? (d/dt)*3600 : null;
+    groundEl.textContent = kmh ? kmh.toFixed(2) + ' km/h' : '—';
+  } else {
+    groundEl.textContent = '—';
+  }
+}
+
+// reverse geocode to get place/country, NEVER return coordinates (fallback -> 'Unknown location')
+const _rg_cache = new Map();
+async function reversePlace(lat, lon){
+  const key = `${lat.toFixed(4)},${lon.toFixed(4)}`;
+  if(_rg_cache.has(key)) return _rg_cache.get(key);
+  try{
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}`;
+    const r = await fetch(url, { headers:{ 'User-Agent':'SpacePass-ISS-Tracker/1.0 (test)' } }).catch(()=>null);
+    if(!r || !r.ok) throw new Error('rg fail');
+    const j = await r.json();
+    // prefer city/town/village or county, then state, then country
+    const name = j.address && (j.address.city || j.address.town || j.address.village || j.address.county || j.address.state || j.address.country);
+    let result = 'Unknown location';
+    if(name && j.address && j.address.country){
+      // show "Place, Country" if possible
+      // if name already equals country, just show country
+      if(name === j.address.country) result = j.address.country;
+      else result = `${name}, ${j.address.country}`;
+    } else if(name){
+      result = name;
+    } else if(j.display_name){
+      // take only the first descriptive part
+      result = j.display_name.split(',')[0];
+    } else {
+      // do NOT return coords — return generic fallback
+      result = 'Unknown location';
+    }
+    _rg_cache.set(key, result);
+    return result;
+  }catch(e){
+    // Always fallback to generic label, not coordinates
+    _rg_cache.set(key, 'Unknown location');
+    return 'Unknown location';
+  }
+}
+
+// update pass UI: prev / now / next names
+async function updatePassInfo(){
+  const n = trackPoints.length;
+  const now = n ? trackPoints[n-1] : null;
+  const prev = n>1 ? trackPoints[n-2] : null;
+  let next = null;
+  if(prev && now){
+    const dt = now.timestamp - prev.timestamp;
+    if(dt > 0){
+      const dLat = (now.latitude - prev.latitude)/dt;
+      const dLon = (now.longitude - prev.longitude)/dt;
+      const predictSec = 90;
+      next = { latitude: now.latitude + dLat * predictSec, longitude: now.longitude + dLon * predictSec, timestamp: now.timestamp + predictSec };
+    }
+  } else if(now) {
+    next = { latitude: now.latitude + 0.1, longitude: now.longitude + 0.1, timestamp: now.timestamp + 90 };
+  }
+  // reverse geocode each (try, but don't block UI if slow)
+  prevPlaceEl.textContent = '—'; nowPlaceEl.textContent='—'; nextPlaceEl.textContent='—';
+  if(prev){
+    reversePlace(prev.latitude, prev.longitude).then(name=> prevPlaceEl.textContent = name);
+  }
+  if(now){
+    reversePlace(now.latitude, now.longitude).then(name=> nowPlaceEl.textContent = name);
+  }
+  if(next){
+    reversePlace(next.latitude, next.longitude).then(name=> nextPlaceEl.textContent = name);
+  }
+}
+
+// update source label
+function updateSourceLabel(){
+  const parts = [];
+  parts.push(USING.tilesLocal ? 'tiles: lokal' : 'tiles: online');
+  parts.push(USING.posAPI ? 'pos: API' : (USING.tleLoaded ? 'pos: TLE/fallback' : 'pos: sample'));
+  sourceStatus.textContent = parts.join(' • ');
+}
+
+// clear track
+clearTrackBtn.addEventListener('click', ()=>{ if(!confirm('Clear recorded track?')) return; trackPoints=[]; trackLine.setLatLngs([]); pointsCountEl.textContent=0; saveTrack(); });
+
+// center button
+centerBtn.addEventListener('click', ()=>{ if(trackPoints.length){ const p = trackPoints[trackPoints.length-1]; map.setView([p.latitude,p.longitude],4); }});
+
+// polling loop
+async function tick(){
+  const pos = await getPosition();
+  record(pos);
+  updatePassInfo();
+  // pan to ISS if few points or desired
+  try{ if(trackPoints.length && map) map.panTo([pos.latitude,pos.longitude], { animate:true, duration:0.5 }); }catch(e){}
+  updateSourceLabel();
+}
+
+async function getPosition(){
+  // prefer API
+  const api = await fetchFromAPI();
+  if(api){ USING.posAPI = true; return api; }
+  USING.posAPI = false;
+  // TLE fallback
+  if(tleLines && window.satellite){
+    const tpos = posFromTLE();
+    if(tpos){ return {...tpos, source:'TLE'} }
+  }
+  // sample
+  return samplePos();
+}
+
+// small wrappers reused
+async function fetchFromAPI(){ try{ const r = await fetch('https://api.wheretheiss.at/v1/satellites/25544'); if(!r.ok) throw new Error('no'); const j = await r.json(); return { latitude:Number(j.latitude), longitude:Number(j.longitude), altitude: j.altitude!==undefined?Number(j.altitude):null, velocity: j.velocity!==undefined?Number(j.velocity):null, timestamp: Number(j.timestamp)||nowUnix(), source:'API' }; }catch(e){ return null; } }
+function samplePos(){ const p = SAMPLE_POSITIONS[Math.floor(Math.random()*SAMPLE_POSITIONS.length)]; return {...p, timestamp: nowUnix(), source:'sample'} }
+
+// initial quick view
+(async ()=>{ try{ const r = await fetch('https://api.wheretheiss.at/v1/satellites/25544').catch(()=>null); if(r && r.ok){ const j = await r.json(); map.setView([j.latitude,j.longitude],3); } else if(trackPoints.length){ const p = trackPoints[trackPoints.length-1]; map.setView([p.latitude,p.longitude],3); } }catch(e){} })();
+
+// tile init sets USING.tilesLocal already
+async function setup(){ await initTiles(); updateSourceLabel(); }
+setup();
+
+// start polling
+setInterval(tick, POLL_MS);
+tick();
+
+</script>
+</body>
+</html>
