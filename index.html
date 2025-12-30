@@ -58,6 +58,14 @@ body{
 h1{ margin:0; font-size:16px; color:var(--accent) }
 .lead{ margin:0; color:var(--muted); font-size:13px }
 
+/* Search */
+.search-row{ display:flex; gap:8px; align-items:center; margin-top:6px; }
+.search-input{ flex:1; padding:8px 10px; border-radius:8px; background:rgba(0,0,0,0.06); border:1px solid rgba(255,255,255,0.03); color:#eaf6ff; }
+.search-results{ position:relative; }
+.results-list{ position:relative; max-height:180px; overflow:auto; margin-top:6px; background:rgba(0,0,0,0.06); border-radius:8px; border:1px solid rgba(255,255,255,0.02); }
+.result-item{ padding:8px 10px; cursor:pointer; border-bottom:1px solid rgba(255,255,255,0.02); color:#eaf6ff; }
+.result-item:hover{ background: rgba(255,255,255,0.02); }
+
 /* Position grid: 2-column aligned */
 .pos-grid{
   display:grid;
@@ -120,6 +128,13 @@ h1{ margin:0; font-size:16px; color:var(--accent) }
 
   <div><div class="small-muted">Sumber:</div><div id="sourceStatus" class="small-muted">mengecek…</div></div>
 
+  <!-- SEARCH: place / device -->
+  <div class="search-row">
+    <input id="searchInput" class="search-input" placeholder="Search country/city (e.g. Indonesia, Jakarta)" />
+    <button id="myLocBtn" class="btn" title="Use device location">My loc</button>
+  </div>
+  <div class="search-results" id="searchResults" style="display:none"></div>
+
   <div class="pos-grid" aria-hidden="false">
     <div class="stat">
       <div class="label">Latitude</div>
@@ -150,7 +165,7 @@ h1{ margin:0; font-size:16px; color:var(--accent) }
   </div>
 
   <div class="pass-card">
-    <div style="font-size:13px;color:var(--muted);margin-bottom:6px">Lewat (Sebelumnya / Sekarang / Berikutnya)</div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:6px">Lewat (Sebelumnya / Sekarang / Berikutnya) — berdasarkan lokasi pencarian</div>
 
     <div class="pass-row">
       <div class="pass-label">Sebelumnya</div>
@@ -194,37 +209,29 @@ h1{ margin:0; font-size:16px; color:var(--accent) }
 
 <script>
 /*
-  SpacePass — final merged & fixed
-  - Past (red) and future (yellow) continuous polylines for ±55 minutes
-  - Single live marker
-  - Avoid abstract jumps, use TLE for propagation or linear fallback
-  - Keep existing features (track storage, TLE cache, MarineRegions reverse)
+  SpacePass — merged + search feature
+  - Adds search/autocomplete (Nominatim)
+  - Compute simple pass detection for a searched place (±55 min sampling every 60s)
+  - Use TLE propagation if available (satellite.js), fallback to linear extrapolation from last track points
+  - Removes small prediction markers; keeps continuous past & future polylines (visual)
 */
 
 // ---- CONFIG ----
 const POLL_MS = 5000;
 const MAX_POINTS = 2000;
-const JUMP_KM_THRESHOLD = 1000; // if gap > 1000 km, break segments
+const JUMP_KM_THRESHOLD = 1000;
 const CELESTRAK_URL = 'https://celestrak.com/NORAD/elements/stations.txt';
-const MARINEREGIONS_EEZ_ENDPOINT = 'https://www.marineregions.org/rest/getGazetteerRecordsByLatLong.json'; // append /{lat}/{lon}
+const MARINEREGIONS_EEZ_ENDPOINT = 'https://www.marineregions.org/rest/getGazetteerRecordsByLatLong.json';
+const SHADOW_INTERVAL_SEC = 60;
+const PAST_DURATION_SEC = 55 * 60;
+const FUTURE_DURATION_SEC = 55 * 60;
 
-// durations: 55 minutes each side
-const SHADOW_INTERVAL_SEC = 60; // sample interval in seconds (1 min)
-const PAST_DURATION_SEC = 55 * 60; // 55 minutes back
-const FUTURE_DURATION_SEC = 55 * 60; // 55 minutes forward
-
-const SAMPLE_POSITIONS = [
-  {latitude: 0.0, longitude: 0.0, altitude: 408, velocity: 27600},
-  {latitude: 0.25, longitude: 0.8, altitude: 407.9, velocity: 27605}
-];
-
-// ---- STATE ----
+// ---- state & ui refs ----
 let USING = { tilesLocal:false, posAPI:false, tleLoaded:false, tleUsed:false };
 let tleLines = null;
 let tleCachedAt = null;
 let lastSourceWasAPI = null;
 
-// ---- UI refs ----
 const latEl = document.getElementById('lat');
 const lonEl = document.getElementById('lon');
 const altEl = document.getElementById('alt');
@@ -240,7 +247,11 @@ const pointsCountEl = document.getElementById('pointsCount');
 const centerBtn = document.getElementById('centerBtn');
 const clearTrackBtn = document.getElementById('clearTrack');
 
-// ---- MAP INIT ----
+const searchInput = document.getElementById('searchInput');
+const searchResults = document.getElementById('searchResults');
+const myLocBtn = document.getElementById('myLocBtn');
+
+// ---- map init ----
 const map = L.map('map', { zoomControl:true }).setView([0,0], 2);
 
 async function testLocalTile(){
@@ -249,7 +260,6 @@ async function testLocalTile(){
     return r && r.ok;
   }catch(e){ return false; }
 }
-
 async function initTiles(){
   const ok = await testLocalTile();
   USING.tilesLocal = !!ok;
@@ -264,41 +274,22 @@ async function initTiles(){
 }
 initTiles();
 
-// ---- ICONS & LINES ----
+// ---- icons / lines ----
 const mainIcon = L.divIcon({
   html: `<svg width="48" height="48" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g><circle cx="32" cy="32" r="18" fill="#ff3b3b" opacity="0.14"/><path d="M20 32h24" stroke="#ff3b3b" stroke-width="2.4" stroke-linecap="round"/></g></svg>`,
   className:'', iconSize:[48,48], iconAnchor:[24,24]
 });
 const issMarker = L.marker([0,0], { icon: mainIcon }).addTo(map);
 
-// Continuous polylines for past & future (single polyline each)
 let pastLine = L.polyline([], { color:'#ff3b3b', weight:4, opacity:0.95 }).addTo(map);
 let futureLine = L.polyline([], { color:'#ffd166', weight:4, opacity:0.95, dashArray: '8 6' }).addTo(map);
 
-// We'll still keep segments for long-term storage visualization (optional)
 let onlineSegments = [];
 let offlineSegments = [];
-let onlinePoints = []; // {latitude, longitude, altitude, velocity, timestamp, source}
+let onlinePoints = [];
 let offlinePoints = [];
 
-// helpers to create older segments (preserved behavior)
-function createOnlineSegment(coords){
-  const seg = L.polyline(coords, { color:'#ff3b3b', weight:3, opacity:0.85 }).addTo(map);
-  onlineSegments.push(seg);
-  return seg;
-}
-function createOfflineSegment(coords){
-  const seg = L.polyline(coords, { color:'#ff7b7b', weight:2.6, opacity:0.6, dashArray:'6 8' }).addTo(map);
-  offlineSegments.push(seg);
-  return seg;
-}
-
-// ---- STORAGE KEYS ----
-const TLE_STORE = 'spacepass_tle_v1';
-const TLE_STORE_AT = 'spacepass_tle_at';
-const TRACK_KEY = 'spacepass_iss_track_v6';
-
-// ---- UTILS ----
+// helpers
 function nowUnix(){ return Math.floor(Date.now()/1000); }
 function haversine(lat1,lon1,lat2,lon2){
   const R=6371; const toRad=Math.PI/180;
@@ -316,7 +307,11 @@ function normalizeLon(lastLon, newLon){
   return n;
 }
 
-// ---- TLE fetch/cache/load ----
+// ---- TLE fetch/cache ----
+const TLE_STORE = 'spacepass_tle_v1';
+const TLE_STORE_AT = 'spacepass_tle_at';
+const TRACK_KEY = 'spacepass_iss_track_v6';
+
 async function fetchAndCacheTLE(){
   try{
     const r = await fetch(CELESTRAK_URL).catch(()=>null);
@@ -339,9 +334,7 @@ async function fetchAndCacheTLE(){
       }
     }
     return false;
-  }catch(e){
-    return false;
-  }
+  }catch(e){ return false; }
 }
 function loadCachedTLE(){
   try{
@@ -361,7 +354,7 @@ function loadCachedTLE(){
 loadCachedTLE();
 fetchAndCacheTLE().catch(()=>{});
 
-// ---- TLE propagation for arbitrary date ----
+// ---- propagate using TLE ----
 function posFromTLEAtDate(date){
   try{
     if(!(tleLines && window.satellite)) return null;
@@ -374,9 +367,7 @@ function posFromTLEAtDate(date){
     const lon = satellite.degreesLong(geo.longitude);
     const alt = geo.height;
     return { latitude: lat, longitude: lon, altitude: alt, velocity: null, timestamp: Math.floor(date.getTime()/1000), source:'TLE' };
-  }catch(e){
-    return null;
-  }
+  }catch(e){ return null; }
 }
 
 // ---- API fetch ----
@@ -393,13 +384,10 @@ async function fetchFromAPI(){
       timestamp: Number(j.timestamp) || nowUnix(),
       source:'API'
     };
-  }catch(e){
-    return null;
-  }
+  }catch(e){ return null; }
 }
 function samplePos(){
-  const p = SAMPLE_POSITIONS[Math.floor(Math.random()*SAMPLE_POSITIONS.length)];
-  return { ...p, timestamp: nowUnix(), source:'sample' };
+  return {latitude:0,longitude:0,altitude:408,velocity:27600, timestamp: nowUnix(), source:'sample'};
 }
 
 // ---- main getPosition (API -> TLE -> sample) ----
@@ -418,7 +406,7 @@ async function getPosition(){
   return samplePos();
 }
 
-// ---- track storage & polylines rebuild (preserve) ----
+// ---- track storage & rebuild ----
 function saveTrack(){
   try{
     const merged = onlinePoints.concat(offlinePoints);
@@ -462,8 +450,18 @@ function rebuildPolylinesFromPoints(){
   splitAndCreate(onlinePoints, coords => createOnlineSegment(coords));
   splitAndCreate(offlinePoints, coords => createOfflineSegment(coords));
 }
+function createOnlineSegment(coords){
+  const seg = L.polyline(coords, { color:'#ff3b3b', weight:3, opacity:0.85 }).addTo(map);
+  onlineSegments.push(seg);
+  return seg;
+}
+function createOfflineSegment(coords){
+  const seg = L.polyline(coords, { color:'#ff7b7b', weight:2.6, opacity:0.6, dashArray:'6 8' }).addTo(map);
+  offlineSegments.push(seg);
+  return seg;
+}
 
-// ---- add point smart (preserve logic) ----
+// ---- addPointSmart (preserve behavior) ----
 function addPointSmart(pos){
   pos = Object.assign({}, pos);
   pos.timestamp = pos.timestamp || nowUnix();
@@ -488,7 +486,7 @@ function addPointSmart(pos){
       saveTrack();
       pointsCountEl.textContent = onlinePoints.length + offlinePoints.length;
       updateUIFromPos(pos);
-      updatePastFutureLines(); // refresh lines
+      updatePastFutureLines();
       return;
     }
   } else {
@@ -551,7 +549,7 @@ function updateUIFromPos(p){
   try{ issMarker.setLatLng([p.latitude, p.longitude]); }catch(e){}
 }
 
-// ---- reverse place (marine -> nominatim) ----
+// ---- reverse place (MarineRegions -> Nominatim) ----
 const _rg_cache = new Map();
 async function lookupMarineRegions(lat, lon){
   try{
@@ -569,18 +567,13 @@ async function lookupMarineRegions(lat, lon){
       }
     }
     return j[0].preferredGazetteerName || j[0].title || j[0].name || null;
-  }catch(e){
-    return null;
-  }
+  }catch(e){ return null; }
 }
 async function reversePlace(lat, lon){
   const key = `${lat.toFixed(4)},${lon.toFixed(4)}`;
   if(_rg_cache.has(key)) return _rg_cache.get(key);
   const mr = await lookupMarineRegions(lat, lon);
-  if(mr){
-    _rg_cache.set(key, mr);
-    return mr;
-  }
+  if(mr){ _rg_cache.set(key, mr); return mr; }
   try{
     const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}`;
     const r = await fetch(url, { headers:{ 'User-Agent':'SpacePass-ISS-Tracker/1.0 (test)' } }).catch(()=>null);
@@ -595,13 +588,10 @@ async function reversePlace(lat, lon){
     else if(j.display_name) result = j.display_name.split(',')[0];
     _rg_cache.set(key, result);
     return result;
-  }catch(e){
-    _rg_cache.set(key, 'Unknown location');
-    return 'Unknown location';
-  }
+  }catch(e){ _rg_cache.set(key, 'Unknown location'); return 'Unknown location'; }
 }
 
-// ---- update pass info (prev / now / next) ----
+// ---- update pass info for panel (prev, now, next) ----
 async function updatePassInfo(){
   const all = onlinePoints.concat(offlinePoints).sort((a,b)=> (a.timestamp||0)-(b.timestamp||0));
   const n = all.length;
@@ -626,7 +616,7 @@ async function updatePassInfo(){
   if(next) reversePlace(next.latitude, next.longitude).then(name=> nextPlaceEl.textContent = name);
 }
 
-// ---- build continuous past & future polylines ----
+// ---- build continuous past/future polylines (±55m) ----
 function getNearestTrackPositionAt(unixSec){
   const all = onlinePoints.concat(offlinePoints);
   if(!all.length) return null;
@@ -637,7 +627,7 @@ function getNearestTrackPositionAt(unixSec){
       bestDiff = d; best = p;
     }
   }
-  if(best && bestDiff <= SHADOW_INTERVAL_SEC + 30) return best; // accept if close enough
+  if(best && bestDiff <= SHADOW_INTERVAL_SEC + 30) return best;
   return null;
 }
 function propagateUsingTLEAt(unixSec){
@@ -652,16 +642,9 @@ async function buildPastPolylinePoints(){
   const pts = [];
   for(let t = start; t <= now; t += SHADOW_INTERVAL_SEC){
     const trackPos = getNearestTrackPositionAt(t);
-    if(trackPos) {
-      pts.push([trackPos.latitude, trackPos.longitude, trackPos.timestamp]);
-      continue;
-    }
+    if(trackPos){ pts.push([trackPos.latitude, trackPos.longitude, trackPos.timestamp]); continue; }
     const tlePos = propagateUsingTLEAt(t);
-    if(tlePos){
-      pts.push([tlePos.latitude, tlePos.longitude, tlePos.timestamp]);
-      continue;
-    }
-    // no data: skip
+    if(tlePos){ pts.push([tlePos.latitude, tlePos.longitude, tlePos.timestamp]); continue; }
   }
   return pts;
 }
@@ -669,7 +652,6 @@ async function buildPastPolylinePoints(){
 function buildFuturePolylinePoints(){
   const now = nowUnix();
   const pts = [];
-  // try TLE propagation first
   if(tleLines && window.satellite){
     for(let dt = SHADOW_INTERVAL_SEC; dt <= FUTURE_DURATION_SEC; dt += SHADOW_INTERVAL_SEC){
       const t = now + dt;
@@ -679,7 +661,6 @@ function buildFuturePolylinePoints(){
     }
     return pts;
   }
-  // fallback linear extrapolation from last two points
   const all = onlinePoints.concat(offlinePoints).sort((a,b)=> (a.timestamp||0)-(b.timestamp||0));
   if(all.length >= 2){
     const a = all[all.length-2], b = all[all.length-1];
@@ -697,7 +678,6 @@ function buildFuturePolylinePoints(){
 }
 
 function normalizePolylineCoordsForWrap(poly){
-  // normalize longitudes to be continuous relative to previous point
   if(!poly || poly.length === 0) return poly;
   const out = [];
   let lastLon = null;
@@ -716,21 +696,14 @@ function normalizePolylineCoordsForWrap(poly){
 
 async function updatePastFutureLines(){
   try{
-    // Past
-    const pastPts = await buildPastPolylinePoints(); // array [lat,lon,ts]
+    const pastPts = await buildPastPolylinePoints();
     const pastCoords = normalizePolylineCoordsForWrap(pastPts);
     pastLine.setLatLngs(pastCoords.map(p=>[p[0], p[1]]));
 
-    // Future
     const futurePts = buildFuturePolylinePoints();
     const futureCoords = normalizePolylineCoordsForWrap(futurePts);
     futureLine.setLatLngs(futureCoords.map(p=>[p[0], p[1]]));
-
-    // optionally reduce visual overlap with stored segments: no change to segments themselves
-  }catch(e){
-    // ignore
-    //console.warn('updatePastFutureLines err', e);
-  }
+  }catch(e){}
 }
 
 // ---- source label update ----
@@ -749,7 +722,7 @@ function updateSourceLabel(){
 clearTrackBtn.addEventListener('click', ()=>{ if(!confirm('Clear recorded track?')) return; onlinePoints=[]; offlinePoints=[]; onlineSegments.forEach(s=>map.removeLayer(s)); offlineSegments.forEach(s=>map.removeLayer(s)); onlineSegments=[]; offlineSegments=[]; pointsCountEl.textContent=0; saveTrack(); pastLine.setLatLngs([]); futureLine.setLatLngs([]); });
 centerBtn.addEventListener('click', ()=>{ const all = onlinePoints.concat(offlinePoints).sort((a,b)=> (a.timestamp||0)-(b.timestamp||0)); if(all.length){ const p = all[all.length-1]; map.setView([p.latitude,p.longitude],4); }});
 
-// ---- main tick ----
+// ---- main polling ----
 async function tick(){
   const pos = await getPosition();
   pos.timestamp = pos.timestamp || nowUnix();
@@ -770,13 +743,11 @@ async function tick(){
   updatePassInfo();
   updateSourceLabel();
 
-  // update continuous past & future lines (non-blocking)
   updatePastFutureLines().catch(()=>{});
-
   try{ if(map && pos) map.panTo([pos.latitude,pos.longitude], { animate:true, duration:0.6 }); }catch(e){}
 }
 
-// ---- initial view and load track ----
+// ---- initial view & load track ----
 (async ()=>{
   try{
     const r = await fetch('https://api.wheretheiss.at/v1/satellites/25544').catch(()=>null);
@@ -796,12 +767,166 @@ async function tick(){
   }catch(e){}
 })();
 
-loadTrack(); // restore past track
-
-// Start polling
+loadTrack();
 setInterval(tick, POLL_MS);
 tick();
 
+// ---- SEARCH: Nominatim autocomplete & pass detection ----
+let searchTimer = null;
+searchInput.addEventListener('input', (e)=>{
+  const q = e.target.value.trim();
+  if(searchTimer) clearTimeout(searchTimer);
+  if(!q){
+    searchResults.style.display = 'none';
+    searchResults.innerHTML = '';
+    return;
+  }
+  // debounce
+  searchTimer = setTimeout(()=> doSearch(q), 300);
+});
+
+async function doSearch(q){
+  try{
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(q)}&limit=8&accept-language=en`;
+    const r = await fetch(url).catch(()=>null);
+    if(!r || !r.ok){ throw new Error('no'); }
+    const j = await r.json();
+    renderSearchResults(j || []);
+  }catch(e){
+    renderSearchResults([]);
+  }
+}
+function renderSearchResults(items){
+  searchResults.innerHTML = '';
+  if(!items || items.length === 0){
+    searchResults.style.display = 'none';
+    return;
+  }
+  const container = document.createElement('div');
+  container.className = 'results-list';
+  items.forEach(it=>{
+    const name = it.display_name || `${it.lat},${it.lon}`;
+    const div = document.createElement('div');
+    div.className = 'result-item';
+    div.textContent = name;
+    div.addEventListener('click', ()=>{
+      // pick this place
+      const lat = parseFloat(it.lat), lon = parseFloat(it.lon);
+      searchResults.style.display = 'none';
+      searchResults.innerHTML = '';
+      searchInput.value = name.split(',')[0];
+      onPlaceSelected(lat, lon, name);
+    });
+    container.appendChild(div);
+  });
+  searchResults.appendChild(container);
+  searchResults.style.display = 'block';
+}
+
+// use device location
+myLocBtn.addEventListener('click', ()=>{
+  if(!navigator.geolocation){ alert('Geolocation not available'); return; }
+  navigator.geolocation.getCurrentPosition(pos=>{
+    const lat = pos.coords.latitude, lon = pos.coords.longitude;
+    onPlaceSelected(lat, lon, 'My location');
+  }, err=>{
+    alert('Could not get location: ' + (err.message || err.code));
+  }, { enableHighAccuracy:true, maximumAge:60000, timeout:10000 });
+});
+
+// when user selects a place: center map & compute pass info for that place
+async function onPlaceSelected(lat, lon, name){
+  map.setView([lat, lon], 5);
+  // compute prev/now/next passes for this location within ±55 minutes
+  const res = await computePassTimesForLocation(lat, lon);
+  // res: { prev: {t, dist} | null, now: {...} | null, next: {...} | null }
+  prevPlaceEl.textContent = res.prev ? (new Date(res.prev.t*1000).toLocaleString() + ' — ' + formatDist(res.prev.dist)) : '—';
+  nowPlaceEl.textContent = res.now ? (new Date(res.now.t*1000).toLocaleString() + ' — ' + formatDist(res.now.dist)) : '—';
+  nextPlaceEl.textContent = res.next ? (new Date(res.next.t*1000).toLocaleString() + ' — ' + formatDist(res.next.dist)) : '—';
+}
+
+// helper format distance
+function formatDist(km){
+  if(km === null || km === undefined) return '';
+  if(km < 1) return (km*1000).toFixed(0) + ' m';
+  return km.toFixed(1) + ' km';
+}
+
+// compute pass times by sampling ±55 minutes at SHADOW_INTERVAL_SEC intervals
+// criteria: distance (great-circle) between sub-satellite point and target
+async function computePassTimesForLocation(lat, lon){
+  const now = nowUnix();
+  const start = now - PAST_DURATION_SEC;
+  const end = now + FUTURE_DURATION_SEC;
+  const cand = [];
+  for(let t = start; t <= end; t += SHADOW_INTERVAL_SEC){
+    const pos = await getPositionAtUnix(t);
+    if(!pos) continue;
+    const d = haversine(lat, lon, pos.latitude, pos.longitude);
+    cand.push({ t, dist: d, source: pos.source });
+  }
+  if(cand.length === 0) return { prev:null, now:null, next:null };
+
+  // find minima windows where distance local minima (we pick best prev (t < now), best future (t > now)), also find now if any near now
+  let bestPrev = null, bestNext = null, bestNow = null;
+  for(const c of cand){
+    if(c.t < now){
+      if(!bestPrev || c.dist < bestPrev.dist) bestPrev = c;
+    } else if(c.t > now){
+      if(!bestNext || c.dist < bestNext.dist) bestNext = c;
+    } else {
+      if(!bestNow || c.dist < bestNow.dist) bestNow = c;
+    }
+  }
+  // find any point at or very near now (within interval)
+  // we also consider "now" as any candidate with t within +/- SHADOW_INTERVAL_SEC of now
+  for(const c of cand){
+    if(Math.abs(c.t - now) <= SHADOW_INTERVAL_SEC){
+      if(!bestNow || c.dist < bestNow.dist) bestNow = c;
+    }
+  }
+
+  // apply threshold to decide if considered "overhead". We'll still return nearest distances, caller can see value.
+  return { prev: bestPrev, now: bestNow, next: bestNext };
+}
+
+// get satellite subpoint at unix time (try TLE propagation else nearest recorded track interpolation)
+async function getPositionAtUnix(unixSec){
+  // 1) TLE propagation
+  if(tleLines && window.satellite){
+    const p = propagateUsingTLEAt(unixSec);
+    if(p) return p;
+  }
+  // 2) nearest recorded track point (if within tolerance)
+  const all = onlinePoints.concat(offlinePoints).sort((a,b)=> (a.timestamp||0)-(b.timestamp||0));
+  if(all.length === 0) return null;
+  // find nearest
+  let best = null, bestDiff = Infinity;
+  for(const pt of all){
+    const d = Math.abs((pt.timestamp||0) - unixSec);
+    if(d < bestDiff){ bestDiff = d; best = pt; }
+  }
+  if(best && bestDiff <= SHADOW_INTERVAL_SEC + 30) return best;
+  // 3) linear extrapolate from last two
+  if(all.length >= 2){
+    const a = all[all.length-2], b = all[all.length-1];
+    const dt = (b.timestamp - a.timestamp) || 1;
+    const ratio = (unixSec - b.timestamp) / dt;
+    const lat = b.latitude + (b.latitude - a.latitude) * ratio;
+    const lon = b.longitude + (b.longitude - a.longitude) * ratio;
+    return { latitude: lat, longitude: lon, altitude: b.altitude || null, velocity: b.velocity || null, timestamp: unixSec, source:'predict' };
+  }
+  return null;
+}
+
+// ---- Search UX: hide results when clicking outside ----
+document.addEventListener('click', (ev)=>{
+  if(!searchResults.contains(ev.target) && ev.target !== searchInput){
+    searchResults.style.display = 'none';
+  }
+});
+
+// ---- finish ----
 </script>
 </body>
 </html>
