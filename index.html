@@ -74,9 +74,6 @@ h1{ margin:0; font-size:16px; color:var(--accent) }
 .stat .label{ color:var(--muted); font-size:13px; }
 .stat .value{ color:#fff; font-weight:700; font-size:16px; margin-top:6px; }
 
-/* Orbit row */
-.orbit-row{ display:flex; gap:8px; align-items:center; justify-content:space-between; }
-
 /* Next pass card */
 .pass-card{ background: rgba(0,0,0,0.06); padding:10px; border-radius:8px; border:1px solid rgba(255,255,255,0.02) }
 .pass-row{ display:flex; justify-content:space-between; gap:8px; padding:6px 0; align-items:center; }
@@ -92,6 +89,9 @@ h1{ margin:0; font-size:16px; color:var(--accent) }
 .map-wrap{ flex:1; border-radius:12px; overflow:hidden; display:flex; flex-direction:column; border:1px solid rgba(255,255,255,0.03) }
 #map{ flex:1; min-height:420px }
 .map-footer{ padding:10px 14px; display:flex; justify-content:space-between; align-items:center; gap:12px; background:rgba(0,0,0,0.08); border-top:1px solid rgba(255,255,255,0.02) }
+
+/* disclaimer */
+.disclaimer{ font-size:12px; color:#cfdfe6; margin-top:8px; opacity:0.9; }
 
 /* responsive */
 @media (max-width:900px){
@@ -174,6 +174,10 @@ h1{ margin:0; font-size:16px; color:var(--accent) }
   </div>
 
   <div class="small-muted">Titik terekam: <span id="pointsCount">0</span></div>
+
+  <div class="disclaimer" id="disclaimer">
+    Data posisi: wheretheiss.at (API) dan TLE lokal (celestrak). Kami tidak bertanggung jawab atas kesalahan posisi atau penggunaan data. Gunakan untuk tujuan edukasi.
+  </div>
 </aside>
 
 <main class="map-wrap">
@@ -190,21 +194,31 @@ h1{ margin:0; font-size:16px; color:var(--accent) }
 
 <script>
 /*
-  SpacePass — combined index.html per request
-  - Prefer API (wheretheiss.at), fallback to TLE (celestrak/iss.txt), then sample
-  - Red polyline & red marker
-  - Show Position grid aligned, Ground speed computed
-  - Next/Prev/Now place names via reverse geocoding (Nominatim) if available
-  - No log download; no visible crew/TLE UI
+  SpacePass — final consolidated index.html
+  Implements:
+   - API (wheretheiss.at) preferred, fallback to local TLE, then sample
+   - Two polylines: online (solid) and offline (lighter)
+   - Handle ±180° wraparound, large jumps, and segment resets
+   - Reverse geocode -> place names only (cache)
+   - Save track to localStorage (max points)
+   - Disclaimer displayed in panel
 */
 
+// Config
 const POLL_MS = 5000;
+const MAX_POINTS = 2000;
+const JUMP_KM_THRESHOLD = 1000; // if >1000km between sequential points -> break segment
+
+// Sample fallback positions
 const SAMPLE_POSITIONS = [
-  {latitude: 0.0, longitude: 0.0, altitude: 408, velocity: 27600, timestamp: Math.floor(Date.now()/1000)-30},
-  {latitude: 0.2, longitude: 0.8, altitude: 407.9, velocity: 27605, timestamp: Math.floor(Date.now()/1000)}
+  {latitude: 0.0, longitude: 0.0, altitude: 408, velocity: 27600},
+  {latitude: 0.25, longitude: 0.8, altitude: 407.9, velocity: 27605}
 ];
 
+// State
 let USING = { tilesLocal:false, posAPI:false, tleLoaded:false, tleUsed:false };
+let tleLines = null;
+let lastSourceWasAPI = null;
 
 // UI refs
 const latEl = document.getElementById('lat');
@@ -222,9 +236,10 @@ const pointsCountEl = document.getElementById('pointsCount');
 const centerBtn = document.getElementById('centerBtn');
 const clearTrackBtn = document.getElementById('clearTrack');
 
-// Map init
+// Map
 const map = L.map('map', { zoomControl:true }).setView([0,0], 2);
 
+// tile check
 async function testLocalTile(){
   try{
     const r = await fetch('tiles/2/1/1.png', { method:'HEAD' }).catch(()=>null);
@@ -246,23 +261,141 @@ async function initTiles(){
 }
 initTiles();
 
-// red marker & polyline
+// icons & polylines
 const redIcon = L.divIcon({
-  html: `<svg width="44" height="44" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g><circle cx="32" cy="32" r="18" fill="${'#ff3b3b'}" opacity="0.12"/><path d="M20 32h24" stroke="${'#ff3b3b'}" stroke-width="2.2" stroke-linecap="round"/></g></svg>`,
+  html: `<svg width="44" height="44" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g><circle cx="32" cy="32" r="18" fill="#ff3b3b" opacity="0.12"/><path d="M20 32h24" stroke="#ff3b3b" stroke-width="2.2" stroke-linecap="round"/></g></svg>`,
   className:'', iconSize:[44,44], iconAnchor:[22,22]
 });
 const issMarker = L.marker([0,0], { icon: redIcon }).addTo(map);
-const trackLine = L.polyline([], { color: '#ff3b3b', weight:3.6, opacity:0.95 }).addTo(map);
-let trackPoints = []; // {latitude,longitude,altitude,velocity,timestamp,source}
 
-// storage key
-const TRACK_KEY = 'spacepass_iss_track_v4';
-function loadTrack(){ try{ const raw = localStorage.getItem(TRACK_KEY); if(raw){ trackPoints = JSON.parse(raw); trackLine.setLatLngs(trackPoints.map(p=>[p.latitude,p.longitude])); pointsCountEl.textContent = trackPoints.length; } }catch(e){ console.warn(e) } }
-function saveTrack(){ try{ localStorage.setItem(TRACK_KEY, JSON.stringify(trackPoints)); }catch(e){} }
-loadTrack();
+// We'll maintain two polylines: online (solid) and offline (dashed/transparent)
+let onlineSegments = []; // array of L.Polyline segments (arrays of L.LatLng)
+let offlineSegments = [];
+let onlinePoints = []; // flat array of points for convenience
+let offlinePoints = [];
 
-// TLE auto-load (silent)
-let tleLines = null;
+// helpers: create new segment polyline
+function createOnlineSegment(coords){
+  const seg = L.polyline(coords, { color:'#ff3b3b', weight:4, opacity:0.98 }).addTo(map);
+  onlineSegments.push(seg);
+  return seg;
+}
+function createOfflineSegment(coords){
+  const seg = L.polyline(coords, { color:'#ff7b7b', weight:2.6, opacity:0.6, dashArray:'6 8' }).addTo(map);
+  offlineSegments.push(seg);
+  return seg;
+}
+
+// load saved points (we store as single array with source field historically)
+const TRACK_KEY = 'spacepass_iss_track_v5';
+function loadTrack(){
+  try{
+    const raw = localStorage.getItem(TRACK_KEY);
+    if(!raw) return;
+    const arr = JSON.parse(raw);
+    // separate into online/offline segments based on source and large jumps
+    let last = null;
+    let currentSeg = null;
+    arr.forEach(pt=>{
+      if(pt.source === 'API'){
+        // online
+        if(!currentSeg || currentSeg.type !== 'online') currentSeg = { type:'online', pts: [] };
+        // handle big jumps as new segment
+        if(currentSeg.pts.length && last){
+          const d = haversine(last.latitude,last.longitude, pt.latitude, pt.longitude);
+          if(d > JUMP_KM_THRESHOLD) currentSeg = { type:'online', pts: [] };
+        }
+        currentSeg.pts.push([pt.latitude, pt.longitude]);
+        last = pt;
+        if(currentSeg && currentSeg.type==='online' && currentSeg.pts.length) {
+          // when switching from offline to online or starting new seg, finalize previous seg
+          if(onlineSegments.length===0 || onlineSegments[onlineSegments.length-1] !== currentSeg){
+            // nothing: we'll finalize at end
+          }
+        }
+      } else {
+        // offline sample/TLE
+        if(!currentSeg || currentSeg.type !== 'offline') currentSeg = { type:'offline', pts: [] };
+        if(currentSeg.pts.length && last){
+          const d = haversine(last.latitude,last.longitude, pt.latitude, pt.longitude);
+          if(d > JUMP_KM_THRESHOLD) currentSeg = { type:'offline', pts: [] };
+        }
+        currentSeg.pts.push([pt.latitude, pt.longitude]);
+        last = pt;
+      }
+    });
+    // Simplify approach: just push all as single online/offline arrays for now
+    // (we'll rebuild live segments later)
+    // For quick restore, push last N points into onlinePoints for visualization
+    const lastN = arr.slice(-500);
+    lastN.forEach(pt => {
+      if(pt.source === 'API') onlinePoints.push(pt);
+      else offlinePoints.push(pt);
+    });
+    rebuildPolylinesFromPoints();
+    pointsCountEl.textContent = onlinePoints.length + offlinePoints.length;
+  }catch(e){ console.warn('loadTrack err', e); }
+}
+function saveTrack(){
+  try{
+    // merge arrays with source field and keep order: assume interleaved in reality; we'll save only combined arrays: online then offline for persistence
+    const combined = [];
+    onlinePoints.forEach(p=>combined.push(Object.assign({},p,{source:'API'})));
+    offlinePoints.forEach(p=>combined.push(Object.assign({},p,{source:p.source||'TLE'})));
+    localStorage.setItem(TRACK_KEY, JSON.stringify(combined.slice(-MAX_POINTS)));
+  }catch(e){ console.warn('saveTrack', e); }
+}
+
+// rebuild polylines from onlinePoints/offlinePoints (simple)
+function rebuildPolylinesFromPoints(){
+  // clear existing
+  onlineSegments.forEach(s=>map.removeLayer(s));
+  offlineSegments.forEach(s=>map.removeLayer(s));
+  onlineSegments = [];
+  offlineSegments = [];
+  // create segments by splitting on large jumps
+  function splitAndCreate(arr, createFn){
+    let segPts = [];
+    let last = null;
+    arr.forEach(p=>{
+      if(last){
+        const d = haversine(last.latitude,last.longitude,p.latitude,p.longitude);
+        if(d > JUMP_KM_THRESHOLD){
+          if(segPts.length) createFn(segPts);
+          segPts = [];
+        }
+      }
+      segPts.push([p.latitude,p.longitude]);
+      last = p;
+    });
+    if(segPts.length) createFn(segPts);
+  }
+  splitAndCreate(onlinePoints, coords => createOnlineSegment(coords));
+  splitAndCreate(offlinePoints, coords => createOfflineSegment(coords));
+}
+
+// helpers: haversine
+function nowUnix(){ return Math.floor(Date.now()/1000); }
+function haversine(lat1,lon1,lat2,lon2){
+  const R=6371; const toRad=Math.PI/180;
+  const dLat=(lat2-lat1)*toRad, dLon=(lon2-lon1)*toRad;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*toRad)*Math.cos(lat2*toRad)*Math.sin(dLon/2)**2;
+  const c = 2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R*c;
+}
+
+// lon normalization: adjust newLon so diff with lastLon is within [-180,180]
+function normalizeLon(lastLon, newLon){
+  if(lastLon === null || lastLon === undefined) return ((newLon+180)%360+360)%360 - 180;
+  let n = newLon;
+  while(n - lastLon > 180) n -= 360;
+  while(n - lastLon < -180) n += 360;
+  // final normalize to [-180,180]
+  n = ((n+180)%360+360)%360 - 180;
+  return n;
+}
+
+// TLE handling
 async function tryAutoTLE(){
   try{
     const resp = await fetch('celestrak/iss.txt').catch(()=>null);
@@ -279,34 +412,24 @@ async function tryAutoTLE(){
 }
 tryAutoTLE();
 
-// helpers
-function nowUnix(){ return Math.floor(Date.now()/1000); }
-function haversine(lat1,lon1,lat2,lon2){
-  const R=6371; const toRad=Math.PI/180;
-  const dLat=(lat2-lat1)*toRad, dLon=(lon2-lon1)*toRad;
-  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*toRad)*Math.cos(lat2*toRad)*Math.sin(dLon/2)**2;
-  const c = 2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-  return R*c;
-}
-
-// compute pos from TLE if satlib present
+// pos from TLE using satellite.js
 function posFromTLE(){
   try{
     if(!(tleLines && window.satellite)) return null;
     const satrec = satellite.twoline2satrec(tleLines[0], tleLines[1]);
     const now = new Date();
     const eci = satellite.propagate(satrec, now);
-    if(!eci.position) return null;
+    if(!eci || !eci.position) return null;
     const gmst = satellite.gstime(now);
     const geo = satellite.eciToGeodetic(eci.position, gmst);
     const lat = satellite.degreesLat(geo.latitude);
     const lon = satellite.degreesLong(geo.longitude);
     const alt = geo.height;
-    return { latitude: lat, longitude: lon, altitude: alt, velocity: null, timestamp: Math.floor(now/1000), source: 'TLE' };
+    return { latitude: lat, longitude: lon, altitude: alt, velocity: null, timestamp: Math.floor(now/1000), source:'TLE' };
   }catch(e){ console.warn('TLE->pos err', e); return null; }
 }
 
-// fetch API
+// API fetch
 async function fetchFromAPI(){
   try{
     const r = await fetch('https://api.wheretheiss.at/v1/satellites/25544');
@@ -318,7 +441,7 @@ async function fetchFromAPI(){
       altitude: j.altitude !== undefined ? Number(j.altitude) : null,
       velocity: j.velocity !== undefined ? Number(j.velocity) : null,
       timestamp: Number(j.timestamp) || nowUnix(),
-      source: 'API'
+      source:'API'
     };
   }catch(e){
     return null;
@@ -328,59 +451,136 @@ async function fetchFromAPI(){
 // fallback sample
 function samplePos(){
   const p = SAMPLE_POSITIONS[Math.floor(Math.random()*SAMPLE_POSITIONS.length)];
-  return {...p, timestamp: nowUnix(), source:'sample'};
+  return { ...p, timestamp: nowUnix(), source:'sample' };
 }
 
-// main getter: prefer API, then TLE, then sample
+// main getPosition (prefer API, then TLE, then sample)
 async function getPosition(){
-  // 1) API
   const api = await fetchFromAPI();
-  if(api){ USING.posAPI = true; updateSourceLabel(); return api; }
+  if(api){ USING.posAPI = true; return api; }
   USING.posAPI = false;
-  // 2) TLE (if loaded and library)
   if(tleLines && window.satellite){
     const tpos = posFromTLE();
-    if(tpos){ updateSourceLabel(); return {...tpos, source:'TLE'} }
+    if(tpos){ return tpos; }
   }
-  // 3) sample
-  updateSourceLabel();
   return samplePos();
 }
 
-// add record
-function record(pos){
-  const p = {
-    latitude: pos.latitude, longitude: pos.longitude,
-    altitude: pos.altitude !== undefined ? pos.altitude : null,
-    velocity: pos.velocity !== undefined ? pos.velocity : null,
-    timestamp: pos.timestamp || nowUnix(),
-    source: pos.source || (USING.posAPI?'API':(USING.tleUsed?'TLE':'sample'))
-  };
-  trackPoints.push(p);
-  if(trackPoints.length > 2000) trackPoints.shift();
-  trackLine.setLatLngs(trackPoints.map(pt=>[pt.latitude,pt.longitude]));
-  issMarker.setLatLng([p.latitude,p.longitude]);
-  pointsCountEl.textContent = trackPoints.length;
+// Add point: decide online/offline segment logic and handle jumps/wraparound
+function addPointSmart(pos){
+  // decide which collection
+  const isAPI = (pos.source === 'API');
+  // choose arrays
+  const arr = isAPI ? onlinePoints : offlinePoints;
+  const otherArr = isAPI ? offlinePoints : onlinePoints;
+  // if we switched from offline -> online, clear offline visual segments if too divergent
+  if(lastSourceWasAPI === false && isAPI){
+    // online regained -> if distance between last offline point and this api point > threshold, drop offline segments to avoid abstract lines
+    if(offlinePoints.length){
+      const lastOffline = offlinePoints[offlinePoints.length-1];
+      const d = haversine(lastOffline.latitude,lastOffline.longitude,pos.latitude,pos.longitude);
+      if(d > JUMP_KM_THRESHOLD){
+        // remove offline polylines visually
+        offlineSegments.forEach(s=>map.removeLayer(s));
+        offlineSegments = [];
+        offlinePoints = [];
+      } else {
+        // keep offlinePoints but don't merge them; we'll leave as separate layer
+      }
+    }
+  }
+  lastSourceWasAPI = isAPI;
+
+  // before push, check large jump from last point of same type
+  const lastSame = arr.length ? arr[arr.length-1] : null;
+  if(lastSame){
+    const d = haversine(lastSame.latitude, lastSame.longitude, pos.latitude, pos.longitude);
+    if(d > JUMP_KM_THRESHOLD){
+      // Start new segment by creating a new polyline and not connecting to previous segment
+      if(isAPI){
+        createOnlineSegment([[pos.latitude,pos.longitude]]);
+      } else {
+        createOfflineSegment([[pos.latitude,pos.longitude]]);
+      }
+      arr.push(pos);
+      // keep arrays length reasonable
+      if(onlinePoints.length + offlinePoints.length > MAX_POINTS){
+        // drop earliest from offline first, then online
+        while(onlinePoints.length + offlinePoints.length > MAX_POINTS){
+          if(offlinePoints.length) offlinePoints.shift();
+          else onlinePoints.shift();
+        }
+      }
+      saveTrack();
+      pointsCountEl.textContent = onlinePoints.length + offlinePoints.length;
+      updateUIFromPos(pos);
+      return;
+    }
+  } else {
+    // no lastSame -> start new segment polyline
+    if(isAPI) createOnlineSegment([[pos.latitude,pos.longitude]]);
+    else createOfflineSegment([[pos.latitude,pos.longitude]]);
+  }
+
+  // Normal path: append point to last segment polyline
+  if(isAPI){
+    // append to last online segment if exists, else create
+    if(onlineSegments.length === 0) createOnlineSegment([[pos.latitude,pos.longitude]]);
+    else {
+      // adjust longitude to avoid wraparound with last point in that segment
+      const seg = onlineSegments[onlineSegments.length-1];
+      const latlngs = seg.getLatLngs();
+      const lastLon = latlngs.length ? latlngs[latlngs.length-1].lng : null;
+      const adjLon = normalizeLon(lastLon, pos.longitude);
+      seg.addLatLng([pos.latitude, adjLon]);
+    }
+    arr.push(pos);
+  } else {
+    if(offlineSegments.length === 0) createOfflineSegment([[pos.latitude,pos.longitude]]);
+    else {
+      const seg = offlineSegments[offlineSegments.length-1];
+      const latlngs = seg.getLatLngs();
+      const lastLon = latlngs.length ? latlngs[latlngs.length-1].lng : null;
+      const adjLon = normalizeLon(lastLon, pos.longitude);
+      seg.addLatLng([pos.latitude, adjLon]);
+    }
+    arr.push(pos);
+  }
+
+  // enforce max size
+  if(onlinePoints.length + offlinePoints.length > MAX_POINTS){
+    if(offlinePoints.length) offlinePoints.shift();
+    else onlinePoints.shift();
+  }
   saveTrack();
-  // update position UI
+  pointsCountEl.textContent = onlinePoints.length + offlinePoints.length;
+  updateUIFromPos(pos);
+}
+
+// Update UI fields from pos
+function updateUIFromPos(p){
   latEl.textContent = p.latitude.toFixed(5);
   lonEl.textContent = p.longitude.toFixed(5);
   altEl.textContent = p.altitude !== null ? p.altitude.toFixed(2) : '—';
   spdEl.textContent = p.velocity !== null ? p.velocity.toFixed(2) : '—';
   typAltEl.textContent = p.altitude ? Math.round(p.altitude) + ' km' : '~408 km';
-  // ground speed: compute between last two
-  if(trackPoints.length >= 2){
-    const a = trackPoints[trackPoints.length-2], b = trackPoints[trackPoints.length-1];
-    const d = haversine(a.latitude,a.longitude,b.latitude,b.longitude);
-    const dt = b.timestamp - a.timestamp;
-    const kmh = (dt>0) ? (d/dt)*3600 : null;
+  // ground speed compute on combined last two points (prefer same-source last two, else compute from last overall two)
+  const all = onlinePoints.concat(offlinePoints);
+  const last = all[all.length-1];
+  const prev = all.length>1 ? all[all.length-2] : null;
+  if(prev && last){
+    const d = haversine(prev.latitude, prev.longitude, last.latitude, last.longitude);
+    const dt = last.timestamp - prev.timestamp;
+    const kmh = dt>0 ? (d/dt)*3600 : null;
     groundEl.textContent = kmh ? kmh.toFixed(2) + ' km/h' : '—';
   } else {
     groundEl.textContent = '—';
   }
+  // update marker
+  try{ issMarker.setLatLng([p.latitude, p.longitude]); }catch(e){}
 }
 
-// reverse geocode to get place/country, NEVER return coordinates (fallback -> 'Unknown location')
+// Reverse geocoding with cache (return place name only; do not return coords)
 const _rg_cache = new Map();
 async function reversePlace(lat, lon){
   const key = `${lat.toFixed(4)},${lon.toFixed(4)}`;
@@ -390,37 +590,27 @@ async function reversePlace(lat, lon){
     const r = await fetch(url, { headers:{ 'User-Agent':'SpacePass-ISS-Tracker/1.0 (test)' } }).catch(()=>null);
     if(!r || !r.ok) throw new Error('rg fail');
     const j = await r.json();
-    // prefer city/town/village or county, then state, then country
     const name = j.address && (j.address.city || j.address.town || j.address.village || j.address.county || j.address.state || j.address.country);
     let result = 'Unknown location';
     if(name && j.address && j.address.country){
-      // show "Place, Country" if possible
-      // if name already equals country, just show country
       if(name === j.address.country) result = j.address.country;
       else result = `${name}, ${j.address.country}`;
-    } else if(name){
-      result = name;
-    } else if(j.display_name){
-      // take only the first descriptive part
-      result = j.display_name.split(',')[0];
-    } else {
-      // do NOT return coords — return generic fallback
-      result = 'Unknown location';
-    }
+    } else if(name) result = name;
+    else if(j.display_name) result = j.display_name.split(',')[0];
     _rg_cache.set(key, result);
     return result;
   }catch(e){
-    // Always fallback to generic label, not coordinates
     _rg_cache.set(key, 'Unknown location');
     return 'Unknown location';
   }
 }
 
-// update pass UI: prev / now / next names
+// update pass UI prev/now/next (names only)
 async function updatePassInfo(){
-  const n = trackPoints.length;
-  const now = n ? trackPoints[n-1] : null;
-  const prev = n>1 ? trackPoints[n-2] : null;
+  const allPoints = onlinePoints.concat(offlinePoints);
+  const n = allPoints.length;
+  const now = n ? allPoints[n-1] : null;
+  const prev = n>1 ? allPoints[n-2] : null;
   let next = null;
   if(prev && now){
     const dt = now.timestamp - prev.timestamp;
@@ -430,20 +620,14 @@ async function updatePassInfo(){
       const predictSec = 90;
       next = { latitude: now.latitude + dLat * predictSec, longitude: now.longitude + dLon * predictSec, timestamp: now.timestamp + predictSec };
     }
-  } else if(now) {
+  } else if(now){
     next = { latitude: now.latitude + 0.1, longitude: now.longitude + 0.1, timestamp: now.timestamp + 90 };
   }
-  // reverse geocode each (try, but don't block UI if slow)
+
   prevPlaceEl.textContent = '—'; nowPlaceEl.textContent='—'; nextPlaceEl.textContent='—';
-  if(prev){
-    reversePlace(prev.latitude, prev.longitude).then(name=> prevPlaceEl.textContent = name);
-  }
-  if(now){
-    reversePlace(now.latitude, now.longitude).then(name=> nowPlaceEl.textContent = name);
-  }
-  if(next){
-    reversePlace(next.latitude, next.longitude).then(name=> nextPlaceEl.textContent = name);
-  }
+  if(prev) reversePlace(prev.latitude, prev.longitude).then(name=> prevPlaceEl.textContent = name);
+  if(now) reversePlace(now.latitude, now.longitude).then(name=> nowPlaceEl.textContent = name);
+  if(next) reversePlace(next.latitude, next.longitude).then(name=> nextPlaceEl.textContent = name);
 }
 
 // update source label
@@ -455,47 +639,49 @@ function updateSourceLabel(){
 }
 
 // clear track
-clearTrackBtn.addEventListener('click', ()=>{ if(!confirm('Clear recorded track?')) return; trackPoints=[]; trackLine.setLatLngs([]); pointsCountEl.textContent=0; saveTrack(); });
+clearTrackBtn.addEventListener('click', ()=>{ if(!confirm('Clear recorded track?')) return; onlinePoints=[]; offlinePoints=[]; onlineSegments.forEach(s=>map.removeLayer(s)); offlineSegments.forEach(s=>map.removeLayer(s)); onlineSegments=[]; offlineSegments=[]; pointsCountEl.textContent=0; saveTrack(); });
 
 // center button
-centerBtn.addEventListener('click', ()=>{ if(trackPoints.length){ const p = trackPoints[trackPoints.length-1]; map.setView([p.latitude,p.longitude],4); }});
+centerBtn.addEventListener('click', ()=>{ const all = onlinePoints.concat(offlinePoints); if(all.length){ const p = all[all.length-1]; map.setView([p.latitude,p.longitude],4); }});
 
-// polling loop
+// main polling
 async function tick(){
+  // get position
   const pos = await getPosition();
-  record(pos);
-  updatePassInfo();
-  // pan to ISS if few points or desired
-  try{ if(trackPoints.length && map) map.panTo([pos.latitude,pos.longitude], { animate:true, duration:0.5 }); }catch(e){}
-  updateSourceLabel();
-}
+  // add timestamp if missing
+  pos.timestamp = pos.timestamp || nowUnix();
 
-async function getPosition(){
-  // prefer API
-  const api = await fetchFromAPI();
-  if(api){ USING.posAPI = true; return api; }
-  USING.posAPI = false;
-  // TLE fallback
-  if(tleLines && window.satellite){
-    const tpos = posFromTLE();
-    if(tpos){ return {...tpos, source:'TLE'} }
+  // If we were online (API) previously and now offline using TLE, create offline segment (we avoid connecting to last API point)
+  if(lastSourceWasAPI === true && pos.source !== 'API'){
+    // start offline segment separated
+    // do nothing special here; addPointSmart handles divergence detection
   }
-  // sample
-  return samplePos();
+
+  addPointSmart(pos);
+
+  updatePassInfo();
+  updateSourceLabel();
+
+  // quick pan
+  try{ if(map && pos) map.panTo([pos.latitude,pos.longitude], { animate:true, duration:0.6 }); }catch(e){}
 }
 
-// small wrappers reused
-async function fetchFromAPI(){ try{ const r = await fetch('https://api.wheretheiss.at/v1/satellites/25544'); if(!r.ok) throw new Error('no'); const j = await r.json(); return { latitude:Number(j.latitude), longitude:Number(j.longitude), altitude: j.altitude!==undefined?Number(j.altitude):null, velocity: j.velocity!==undefined?Number(j.velocity):null, timestamp: Number(j.timestamp)||nowUnix(), source:'API' }; }catch(e){ return null; } }
-function samplePos(){ const p = SAMPLE_POSITIONS[Math.floor(Math.random()*SAMPLE_POSITIONS.length)]; return {...p, timestamp: nowUnix(), source:'sample'} }
+// initial quick view: try API
+(async ()=>{
+  try{
+    const r = await fetch('https://api.wheretheiss.at/v1/satellites/25544').catch(()=>null);
+    if(r && r.ok){
+      const j = await r.json();
+      map.setView([j.latitude,j.longitude], 3);
+    } else if(onlinePoints.length+offlinePoints.length){
+      const all = onlinePoints.concat(offlinePoints);
+      map.setView([all[all.length-1].latitude, all[all.length-1].longitude], 3);
+    }
+  }catch(e){}
+})();
 
-// initial quick view
-(async ()=>{ try{ const r = await fetch('https://api.wheretheiss.at/v1/satellites/25544').catch(()=>null); if(r && r.ok){ const j = await r.json(); map.setView([j.latitude,j.longitude],3); } else if(trackPoints.length){ const p = trackPoints[trackPoints.length-1]; map.setView([p.latitude,p.longitude],3); } }catch(e){} })();
-
-// tile init sets USING.tilesLocal already
-async function setup(){ await initTiles(); updateSourceLabel(); }
-setup();
-
-// start polling
+// load saved track then start
+loadTrack();
 setInterval(tick, POLL_MS);
 tick();
 
