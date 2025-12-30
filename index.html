@@ -209,11 +209,10 @@ h1{ margin:0; font-size:16px; color:var(--accent) }
 
 <script>
 /*
-  SpacePass — merged + search feature
-  - Adds search/autocomplete (Nominatim)
-  - Compute simple pass detection for a searched place (±55 min sampling every 60s)
-  - Use TLE propagation if available (satellite.js), fallback to linear extrapolation from last track points
-  - Removes small prediction markers; keeps continuous past & future polylines (visual)
+  SpacePass — final merged: search + red past line only
+  - Removed future yellow line (user requested)
+  - Search (Nominatim) autocomplete + compute pass near searched point (±55m)
+  - Keeps TLE caching/propagation, API fallback, stored track, and avoids abstract jumps
 */
 
 // ---- CONFIG ----
@@ -224,6 +223,7 @@ const CELESTRAK_URL = 'https://celestrak.com/NORAD/elements/stations.txt';
 const MARINEREGIONS_EEZ_ENDPOINT = 'https://www.marineregions.org/rest/getGazetteerRecordsByLatLong.json';
 const SHADOW_INTERVAL_SEC = 60;
 const PAST_DURATION_SEC = 55 * 60;
+// FUTURE_DURATION_SEC still used for pass detection window (search), but we won't draw future line
 const FUTURE_DURATION_SEC = 55 * 60;
 
 // ---- state & ui refs ----
@@ -281,8 +281,8 @@ const mainIcon = L.divIcon({
 });
 const issMarker = L.marker([0,0], { icon: mainIcon }).addTo(map);
 
+// Continuous past polyline only (red)
 let pastLine = L.polyline([], { color:'#ff3b3b', weight:4, opacity:0.95 }).addTo(map);
-let futureLine = L.polyline([], { color:'#ffd166', weight:4, opacity:0.95, dashArray: '8 6' }).addTo(map);
 
 let onlineSegments = [];
 let offlineSegments = [];
@@ -486,7 +486,7 @@ function addPointSmart(pos){
       saveTrack();
       pointsCountEl.textContent = onlinePoints.length + offlinePoints.length;
       updateUIFromPos(pos);
-      updatePastFutureLines();
+      updatePastLine();
       return;
     }
   } else {
@@ -497,7 +497,7 @@ function addPointSmart(pos){
     saveTrack();
     pointsCountEl.textContent = onlinePoints.length + offlinePoints.length;
     updateUIFromPos(pos);
-    updatePastFutureLines();
+    updatePastLine();
     return;
   }
 
@@ -518,7 +518,7 @@ function addPointSmart(pos){
   saveTrack();
   pointsCountEl.textContent = onlinePoints.length + offlinePoints.length;
   updateUIFromPos(pos);
-  updatePastFutureLines();
+  updatePastLine();
 }
 
 function truncatePointsIfNeeded(){
@@ -616,7 +616,7 @@ async function updatePassInfo(){
   if(next) reversePlace(next.latitude, next.longitude).then(name=> nextPlaceEl.textContent = name);
 }
 
-// ---- build continuous past/future polylines (±55m) ----
+// ---- build continuous past polyline (±55m past only) ----
 function getNearestTrackPositionAt(unixSec){
   const all = onlinePoints.concat(offlinePoints);
   if(!all.length) return null;
@@ -649,34 +649,6 @@ async function buildPastPolylinePoints(){
   return pts;
 }
 
-function buildFuturePolylinePoints(){
-  const now = nowUnix();
-  const pts = [];
-  if(tleLines && window.satellite){
-    for(let dt = SHADOW_INTERVAL_SEC; dt <= FUTURE_DURATION_SEC; dt += SHADOW_INTERVAL_SEC){
-      const t = now + dt;
-      const p = propagateUsingTLEAt(t);
-      if(p) pts.push([p.latitude, p.longitude, p.timestamp]);
-      else break;
-    }
-    return pts;
-  }
-  const all = onlinePoints.concat(offlinePoints).sort((a,b)=> (a.timestamp||0)-(b.timestamp||0));
-  if(all.length >= 2){
-    const a = all[all.length-2], b = all[all.length-1];
-    const dt = (b.timestamp - a.timestamp) || 1;
-    const dLatPerSec = (b.latitude - a.latitude)/dt;
-    const dLonPerSec = (b.longitude - a.longitude)/dt;
-    for(let dt2 = SHADOW_INTERVAL_SEC; dt2 <= FUTURE_DURATION_SEC; dt2 += SHADOW_INTERVAL_SEC){
-      const t = now + dt2;
-      const lat = b.latitude + dLatPerSec * dt2;
-      const lon = b.longitude + dLonPerSec * dt2;
-      pts.push([lat, lon, t]);
-    }
-  }
-  return pts;
-}
-
 function normalizePolylineCoordsForWrap(poly){
   if(!poly || poly.length === 0) return poly;
   const out = [];
@@ -694,15 +666,11 @@ function normalizePolylineCoordsForWrap(poly){
   return out;
 }
 
-async function updatePastFutureLines(){
+async function updatePastLine(){
   try{
     const pastPts = await buildPastPolylinePoints();
     const pastCoords = normalizePolylineCoordsForWrap(pastPts);
     pastLine.setLatLngs(pastCoords.map(p=>[p[0], p[1]]));
-
-    const futurePts = buildFuturePolylinePoints();
-    const futureCoords = normalizePolylineCoordsForWrap(futurePts);
-    futureLine.setLatLngs(futureCoords.map(p=>[p[0], p[1]]));
   }catch(e){}
 }
 
@@ -719,7 +687,7 @@ function updateSourceLabel(){
 }
 
 // ---- controls ----
-clearTrackBtn.addEventListener('click', ()=>{ if(!confirm('Clear recorded track?')) return; onlinePoints=[]; offlinePoints=[]; onlineSegments.forEach(s=>map.removeLayer(s)); offlineSegments.forEach(s=>map.removeLayer(s)); onlineSegments=[]; offlineSegments=[]; pointsCountEl.textContent=0; saveTrack(); pastLine.setLatLngs([]); futureLine.setLatLngs([]); });
+clearTrackBtn.addEventListener('click', ()=>{ if(!confirm('Clear recorded track?')) return; onlinePoints=[]; offlinePoints=[]; onlineSegments.forEach(s=>map.removeLayer(s)); offlineSegments.forEach(s=>map.removeLayer(s)); onlineSegments=[]; offlineSegments=[]; pointsCountEl.textContent=0; saveTrack(); pastLine.setLatLngs([]); });
 centerBtn.addEventListener('click', ()=>{ const all = onlinePoints.concat(offlinePoints).sort((a,b)=> (a.timestamp||0)-(b.timestamp||0)); if(all.length){ const p = all[all.length-1]; map.setView([p.latitude,p.longitude],4); }});
 
 // ---- main polling ----
@@ -743,7 +711,7 @@ async function tick(){
   updatePassInfo();
   updateSourceLabel();
 
-  updatePastFutureLines().catch(()=>{});
+  updatePastLine().catch(()=>{});
   try{ if(map && pos) map.panTo([pos.latitude,pos.longitude], { animate:true, duration:0.6 }); }catch(e){}
 }
 
@@ -810,7 +778,6 @@ function renderSearchResults(items){
     div.className = 'result-item';
     div.textContent = name;
     div.addEventListener('click', ()=>{
-      // pick this place
       const lat = parseFloat(it.lat), lon = parseFloat(it.lon);
       searchResults.style.display = 'none';
       searchResults.innerHTML = '';
@@ -837,9 +804,7 @@ myLocBtn.addEventListener('click', ()=>{
 // when user selects a place: center map & compute pass info for that place
 async function onPlaceSelected(lat, lon, name){
   map.setView([lat, lon], 5);
-  // compute prev/now/next passes for this location within ±55 minutes
   const res = await computePassTimesForLocation(lat, lon);
-  // res: { prev: {t, dist} | null, now: {...} | null, next: {...} | null }
   prevPlaceEl.textContent = res.prev ? (new Date(res.prev.t*1000).toLocaleString() + ' — ' + formatDist(res.prev.dist)) : '—';
   nowPlaceEl.textContent = res.now ? (new Date(res.now.t*1000).toLocaleString() + ' — ' + formatDist(res.now.dist)) : '—';
   nextPlaceEl.textContent = res.next ? (new Date(res.next.t*1000).toLocaleString() + ' — ' + formatDist(res.next.dist)) : '—';
@@ -853,7 +818,6 @@ function formatDist(km){
 }
 
 // compute pass times by sampling ±55 minutes at SHADOW_INTERVAL_SEC intervals
-// criteria: distance (great-circle) between sub-satellite point and target
 async function computePassTimesForLocation(lat, lon){
   const now = nowUnix();
   const start = now - PAST_DURATION_SEC;
@@ -867,7 +831,6 @@ async function computePassTimesForLocation(lat, lon){
   }
   if(cand.length === 0) return { prev:null, now:null, next:null };
 
-  // find minima windows where distance local minima (we pick best prev (t < now), best future (t > now)), also find now if any near now
   let bestPrev = null, bestNext = null, bestNow = null;
   for(const c of cand){
     if(c.t < now){
@@ -878,36 +841,28 @@ async function computePassTimesForLocation(lat, lon){
       if(!bestNow || c.dist < bestNow.dist) bestNow = c;
     }
   }
-  // find any point at or very near now (within interval)
-  // we also consider "now" as any candidate with t within +/- SHADOW_INTERVAL_SEC of now
   for(const c of cand){
     if(Math.abs(c.t - now) <= SHADOW_INTERVAL_SEC){
       if(!bestNow || c.dist < bestNow.dist) bestNow = c;
     }
   }
-
-  // apply threshold to decide if considered "overhead". We'll still return nearest distances, caller can see value.
   return { prev: bestPrev, now: bestNow, next: bestNext };
 }
 
 // get satellite subpoint at unix time (try TLE propagation else nearest recorded track interpolation)
 async function getPositionAtUnix(unixSec){
-  // 1) TLE propagation
   if(tleLines && window.satellite){
     const p = propagateUsingTLEAt(unixSec);
     if(p) return p;
   }
-  // 2) nearest recorded track point (if within tolerance)
   const all = onlinePoints.concat(offlinePoints).sort((a,b)=> (a.timestamp||0)-(b.timestamp||0));
   if(all.length === 0) return null;
-  // find nearest
   let best = null, bestDiff = Infinity;
   for(const pt of all){
     const d = Math.abs((pt.timestamp||0) - unixSec);
     if(d < bestDiff){ bestDiff = d; best = pt; }
   }
   if(best && bestDiff <= SHADOW_INTERVAL_SEC + 30) return best;
-  // 3) linear extrapolate from last two
   if(all.length >= 2){
     const a = all[all.length-2], b = all[all.length-1];
     const dt = (b.timestamp - a.timestamp) || 1;
