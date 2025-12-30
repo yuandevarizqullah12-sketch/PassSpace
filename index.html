@@ -194,13 +194,8 @@ h1{ margin:0; font-size:16px; color:var(--accent) }
 
 <script>
 /*
-  SpacePass — improved index.html
-  - API preferred (wheretheiss.at)
-  - TLE auto-fetched from Celestrak (stations.txt) and cached in localStorage
-  - Offline uses cached TLE for propagation (satellite.js)
-  - Uses MarineRegions REST to check EEZ (if available), fallback Nominatim
-  - Handles ±180° wrap, big jumps, segment resets, separate online/offline polylines
-  - Prevents abstract lines when switching online/offline
+  SpacePass — updated: add 2h-back + 2h-forward shadow markers (marker jalur)
+  Keep all original behavior; only add marker-path features and safety fixes.
 */
 
 // ---- CONFIG ----
@@ -210,11 +205,26 @@ const JUMP_KM_THRESHOLD = 1000; // if gap > 1000 km, start new segment
 const CELESTRAK_URL = 'https://celestrak.com/NORAD/elements/stations.txt';
 const MARINEREGIONS_EEZ_ENDPOINT = 'https://www.marineregions.org/rest/getGazetteerRecordsByLatLong.json'; // append /{lat}/{lon}
 
+// sampling for shadow markers
+const SHADOW_INTERVAL_SEC = 60; // sample every 60s (1 minute)
+const PAST_DURATION_SEC = 2 * 3600; // 2 hours back
+const FUTURE_DURATION_SEC = 2 * 3600; // 2 hours forward
+
+// small sample fallback positions (used only if no API/TLE)
+const SAMPLE_POSITIONS = [
+  {latitude: 0.0, longitude: 0.0, altitude: 408, velocity: 27600},
+  {latitude: 0.25, longitude: 0.8, altitude: 407.9, velocity: 27605}
+];
+
 // ---- STATE ----
 let USING = { tilesLocal:false, posAPI:false, tleLoaded:false, tleUsed:false };
 let tleLines = null; // [line1, line2]
 let tleCachedAt = null;
 let lastSourceWasAPI = null;
+
+// shadow markers storage
+let pastShadowMarkers = [];
+let futureShadowMarkers = [];
 
 // ---- UI refs ----
 const latEl = document.getElementById('lat');
@@ -261,7 +271,12 @@ const redIcon = L.divIcon({
   html: `<svg width="44" height="44" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g><circle cx="32" cy="32" r="18" fill="#ff3b3b" opacity="0.12"/><path d="M20 32h24" stroke="#ff3b3b" stroke-width="2.2" stroke-linecap="round"/></g></svg>`,
   className:'', iconSize:[44,44], iconAnchor:[22,22]
 });
-const issMarker = L.marker([0,0], { icon: redIcon }).addTo(map);
+const mainIcon = L.divIcon({
+  html: `<svg width="48" height="48" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g><circle cx="32" cy="32" r="18" fill="#ff3b3b" opacity="0.12"/><path d="M20 32h24" stroke="#ff3b3b" stroke-width="2.2" stroke-linecap="round"/></g></svg>`,
+  className:'', iconSize:[48,48], iconAnchor:[24,24]
+});
+// main marker (current position)
+const issMarker = L.marker([0,0], { icon: mainIcon }).addTo(map);
 
 // We'll keep arrays of segments (each segment is an L.Polyline)
 let onlineSegments = [];
@@ -329,7 +344,6 @@ async function fetchAndCacheTLE(){
         }
       }
     }
-    // fallback: sometimes stations.txt lists "ISS (ZARYA)" exactly; above already tests
     return false;
   }catch(e){
     return false;
@@ -354,21 +368,23 @@ loadCachedTLE();
 // try fetch in background (don't block)
 fetchAndCacheTLE().catch(()=>{});
 
-// ---- PROPAGATION FROM TLE ----
-function posFromTLE(){
+// ---- PROPAGATION FROM TLE (for arbitrary date) ----
+function posFromTLEAtDate(date){
   try{
     if(!(tleLines && window.satellite)) return null;
     const satrec = satellite.twoline2satrec(tleLines[0], tleLines[1]);
-    const now = new Date();
-    const eci = satellite.propagate(satrec, now);
+    const eci = satellite.propagate(satrec, date);
     if(!eci || !eci.position) return null;
-    const gmst = satellite.gstime(now);
+    const gmst = satellite.gstime(date);
     const geo = satellite.eciToGeodetic(eci.position, gmst);
     const lat = satellite.degreesLat(geo.latitude);
     const lon = satellite.degreesLong(geo.longitude);
     const alt = geo.height;
-    return { latitude: lat, longitude: lon, altitude: alt, velocity: null, timestamp: Math.floor(now/1000), source:'TLE' };
-  }catch(e){ console.warn('TLE->pos err', e); return null; }
+    return { latitude: lat, longitude: lon, altitude: alt, velocity: null, timestamp: Math.floor(date.getTime()/1000), source:'TLE' };
+  }catch(e){
+    //console.warn('posFromTLEAtDate err', e);
+    return null;
+  }
 }
 
 // ---- API FETCH ----
@@ -406,7 +422,7 @@ async function getPosition(){
   USING.posAPI = false;
   // try TLE from cached or loaded
   if(tleLines && window.satellite){
-    const tpos = posFromTLE();
+    const tpos = posFromTLEAtDate(new Date());
     if(tpos){
       return tpos;
     }
@@ -417,13 +433,9 @@ async function getPosition(){
 // ---- TRACK STORAGE & REBUILD ----
 function saveTrack(){
   try{
-    // preserve order onlinePoints then offlinePoints (we store their source in objects)
-    const combined = [];
-    // To keep temporal order better, store timestamps combined and sort before saving:
     const merged = onlinePoints.concat(offlinePoints);
     merged.sort((a,b)=> (a.timestamp||0) - (b.timestamp||0));
-    merged.slice(-MAX_POINTS).forEach(p=> combined.push(p));
-    localStorage.setItem(TRACK_KEY, JSON.stringify(combined));
+    localStorage.setItem(TRACK_KEY, JSON.stringify(merged.slice(-MAX_POINTS)));
   }catch(e){ console.warn('saveTrack', e); }
 }
 function loadTrack(){
@@ -431,7 +443,6 @@ function loadTrack(){
     const raw = localStorage.getItem(TRACK_KEY);
     if(!raw) return;
     const arr = JSON.parse(raw);
-    // split by source
     arr.forEach(pt=>{
       if(pt.source === 'API') onlinePoints.push(pt);
       else offlinePoints.push(pt);
@@ -441,11 +452,9 @@ function loadTrack(){
   }catch(e){ console.warn('loadTrack', e); }
 }
 function rebuildPolylinesFromPoints(){
-  // clear old
   onlineSegments.forEach(s=>map.removeLayer(s));
   offlineSegments.forEach(s=>map.removeLayer(s));
   onlineSegments = []; offlineSegments = [];
-  // helper to split on large jumps and create segments
   function splitAndCreate(arr, createFn){
     let seg = [];
     let last = null;
@@ -469,40 +478,33 @@ function rebuildPolylinesFromPoints(){
 // ---- ADD POINT SMART: segmentation, normalization, transitions ----
 function addPointSmart(pos){
   pos = Object.assign({}, pos); // copy
-  // timestamp
   pos.timestamp = pos.timestamp || nowUnix();
   const isAPI = pos.source === 'API';
 
-  // if recently online and now offline and distance large -> do not join; create offline segment (handled by subsequent logic)
   if(lastSourceWasAPI === true && !isAPI){
-    // No immediate merge — offline positions handled as their own segments
+    // preserve separation; handled below
   }
 
   lastSourceWasAPI = isAPI;
 
   const arr = isAPI ? onlinePoints : offlinePoints;
   const segs = isAPI ? onlineSegments : offlineSegments;
-
-  // get last point of same type
   const lastSame = arr.length ? arr[arr.length-1] : null;
 
-  // If there is a lastSame, check distance
   if(lastSame){
     const d = haversine(lastSame.latitude,lastSame.longitude,pos.latitude,pos.longitude);
     if(d > JUMP_KM_THRESHOLD){
-      // Start a brand new segment (don't connect)
       if(isAPI) createOnlineSegment([[pos.latitude,pos.longitude]]);
       else createOfflineSegment([[pos.latitude,pos.longitude]]);
       arr.push(pos);
-      // ensure size
       truncatePointsIfNeeded();
       saveTrack();
       pointsCountEl.textContent = onlinePoints.length + offlinePoints.length;
       updateUIFromPos(pos);
+      updateShadowMarkers(); // refresh shadows
       return;
     }
   } else {
-    // no lastSame -> start new segment
     if(isAPI) createOnlineSegment([[pos.latitude,pos.longitude]]);
     else createOfflineSegment([[pos.latitude,pos.longitude]]);
     arr.push(pos);
@@ -510,10 +512,10 @@ function addPointSmart(pos){
     saveTrack();
     pointsCountEl.textContent = onlinePoints.length + offlinePoints.length;
     updateUIFromPos(pos);
+    updateShadowMarkers();
     return;
   }
 
-  // Normal append to last segment with longitude normalization
   const seg = segs.length ? segs[segs.length-1] : null;
   if(!seg){
     if(isAPI) createOnlineSegment([[pos.latitude,pos.longitude]]);
@@ -523,7 +525,6 @@ function addPointSmart(pos){
     const lastLon = latlngs.length ? latlngs[latlngs.length-1].lng : null;
     const adjLon = normalizeLon(lastLon, pos.longitude);
     seg.addLatLng([pos.latitude, adjLon]);
-    // replace stored pos.longitude with adjLon for internal arrays for consistency
     pos.longitude = adjLon;
   }
 
@@ -532,6 +533,7 @@ function addPointSmart(pos){
   saveTrack();
   pointsCountEl.textContent = onlinePoints.length + offlinePoints.length;
   updateUIFromPos(pos);
+  updateShadowMarkers();
 }
 
 // ensure arrays not exceed MAX_POINTS (drop oldest from offline first)
@@ -549,7 +551,6 @@ function updateUIFromPos(p){
   altEl.textContent = p.altitude !== null ? p.altitude.toFixed(2) : '—';
   spdEl.textContent = p.velocity !== null ? p.velocity.toFixed(2) : '—';
   typAltEl.textContent = p.altitude ? Math.round(p.altitude) + ' km' : '~408 km';
-  // compute ground speed using last two overall points
   const all = onlinePoints.concat(offlinePoints).sort((a,b)=> (a.timestamp||0)-(b.timestamp||0));
   const last = all[all.length-1];
   const prev = all.length>1 ? all[all.length-2] : null;
@@ -561,35 +562,26 @@ function updateUIFromPos(p){
   } else {
     groundEl.textContent = '—';
   }
-  // update marker
   try{ issMarker.setLatLng([p.latitude, p.longitude]); }catch(e){}
 }
 
-// ---- Reverse place: MarineRegions first -> fallback Nominatim; always return human-readable name only ----
+// ---- Reverse place: MarineRegions first -> fallback Nominatim; always return readable name only ----
 const _rg_cache = new Map();
 async function lookupMarineRegions(lat, lon){
   try{
-    // endpoint expects /lat/lon
     const url = `${MARINEREGIONS_EEZ_ENDPOINT}/${encodeURIComponent(lat)}/${encodeURIComponent(lon)}`;
     const r = await fetch(url).catch(()=>null);
     if(!r || !r.ok) throw new Error('mr fail');
     const j = await r.json();
     if(!Array.isArray(j) || j.length === 0) throw new Error('mr empty');
-    // Find EEZ / sovereignty record - look for fields indicating "EEZ" or "Exclusive Economic Zone" or sovereign features
-    // Response items may include 'name' or 'preferredGazetteerName' or 'title'
     for(const item of j){
-      // try common keys
       if(item && (item.name || item.title || item.preferredGazetteerName)){
-        // If the item refers to 'EEZ' or 'Exclusive Economic Zone' or has 'sovereign' info, return sovereign or name
         const nm = item.preferredGazetteerName || item.title || item.name;
-        // Some entries include 'sovereign' or 'sovereignname' fields; prefer country-like label if present
         if(item.sovereign) return `${nm} (EEZ: ${item.sovereign})`;
         if(item.sovereignname) return `${nm} (EEZ: ${item.sovereignname})`;
-        // fallback to nm
         return String(nm);
       }
     }
-    // fallback: return first display_name-like
     return j[0].preferredGazetteerName || j[0].title || j[0].name || null;
   }catch(e){
     return null;
@@ -598,13 +590,11 @@ async function lookupMarineRegions(lat, lon){
 async function reversePlace(lat, lon){
   const key = `${lat.toFixed(4)},${lon.toFixed(4)}`;
   if(_rg_cache.has(key)) return _rg_cache.get(key);
-  // 1) try MarineRegions EEZ API
   const mr = await lookupMarineRegions(lat, lon);
   if(mr){
     _rg_cache.set(key, mr);
     return mr;
   }
-  // 2) fallback Nominatim
   try{
     const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}`;
     const r = await fetch(url, { headers:{ 'User-Agent':'SpacePass-ISS-Tracker/1.0 (test)' } }).catch(()=>null);
@@ -650,12 +640,123 @@ async function updatePassInfo(){
   if(next) reversePlace(next.latitude, next.longitude).then(name=> nextPlaceEl.textContent = name);
 }
 
+// ---- shadow markers management ----
+function clearShadowMarkers(){
+  pastShadowMarkers.forEach(m => map.removeLayer(m));
+  futureShadowMarkers.forEach(m => map.removeLayer(m));
+  pastShadowMarkers = [];
+  futureShadowMarkers = [];
+}
+function createPastMarker(lat, lon){
+  const m = L.circleMarker([lat, lon], { radius: 3.2, fill:true, fillOpacity:0.9, color:'#0097ff', weight:1, opacity:0.95 }).addTo(map);
+  pastShadowMarkers.push(m);
+  return m;
+}
+function createFutureMarker(lat, lon){
+  const m = L.circleMarker([lat, lon], { radius: 3.2, fill:true, fillOpacity:0.8, color:'#9adf00', weight:1, opacity:0.85 }).addTo(map);
+  futureShadowMarkers.push(m);
+  return m;
+}
+
+// get position for arbitrary unix time (try track nearest, else TLE propagation)
+function getNearestTrackPositionAt(unixSec){
+  const all = onlinePoints.concat(offlinePoints);
+  if(!all.length) return null;
+  let best = null, bestDiff = Infinity;
+  for(const p of all){
+    const d = Math.abs((p.timestamp||0) - unixSec);
+    if(d < bestDiff){
+      bestDiff = d; best = p;
+    }
+  }
+  // if close enough (<= 90s) return it
+  if(best && bestDiff <= 90) return { latitude: best.latitude, longitude: best.longitude, timestamp: best.timestamp, source: best.source };
+  return null;
+}
+
+function propagateUsingTLEAt(unixSec){
+  if(!(tleLines && window.satellite)) return null;
+  const date = new Date(unixSec*1000);
+  return posFromTLEAtDate(date);
+}
+
+// build past positions array sampled every SHADOW_INTERVAL_SEC between now-PAST_DURATION_SEC and now
+async function buildPastPositions(){
+  const now = nowUnix();
+  const start = now - PAST_DURATION_SEC;
+  const positions = [];
+  for(let t = start; t <= now; t += SHADOW_INTERVAL_SEC){
+    // 1) nearest track point
+    const fromTrack = getNearestTrackPositionAt(t);
+    if(fromTrack) positions.push(fromTrack);
+    else {
+      // 2) fallback TLE propagation
+      const p = propagateUsingTLEAt(t);
+      if(p) positions.push(p);
+      // else skip (no data)
+    }
+    // limit markers to reasonable number automatically by interval*duration
+  }
+  return positions;
+}
+
+// build future positions by propagation using TLE; if no TLE fallback to linear extrapolation from last two track points
+function buildFuturePositions(){
+  const now = nowUnix();
+  const out = [];
+  // prefer TLE
+  if(tleLines && window.satellite){
+    for(let dt = SHADOW_INTERVAL_SEC; dt <= FUTURE_DURATION_SEC; dt += SHADOW_INTERVAL_SEC){
+      const t = now + dt;
+      const p = propagateUsingTLEAt(t);
+      if(p) out.push(p);
+      else break;
+    }
+    return out;
+  }
+  // fallback linear extrapolation using last two points
+  const all = onlinePoints.concat(offlinePoints).sort((a,b)=> (a.timestamp||0)-(b.timestamp||0));
+  if(all.length >= 2){
+    const a = all[all.length-2], b = all[all.length-1];
+    const dt = (b.timestamp - a.timestamp) || 1;
+    const dLatPerSec = (b.latitude - a.latitude)/dt;
+    const dLonPerSec = (b.longitude - a.longitude)/dt;
+    for(let dt2 = SHADOW_INTERVAL_SEC; dt2 <= FUTURE_DURATION_SEC; dt2 += SHADOW_INTERVAL_SEC){
+      const t = now + dt2;
+      const lat = b.latitude + dLatPerSec * dt2;
+      const lon = b.longitude + dLonPerSec * dt2;
+      out.push({ latitude: lat, longitude: lon, timestamp: t, source: 'predict' });
+    }
+    return out;
+  }
+  return out; // empty
+}
+
+// create shadow markers from computed arrays
+async function updateShadowMarkers(){
+  try{
+    clearShadowMarkers();
+    const past = await buildPastPositions();
+    // create markers for past (limit to last N)
+    for(const p of past){
+      createPastMarker(p.latitude, p.longitude);
+    }
+    // future
+    const future = buildFuturePositions();
+    for(const p of future){
+      createFutureMarker(p.latitude, p.longitude);
+    }
+  }catch(e){
+    // ignore
+    //console.warn('updateShadowMarkers err', e);
+  }
+}
+
 // ---- source label update ----
 function updateSourceLabel(){
   const parts = [];
   parts.push(USING.tilesLocal ? 'tiles: lokal' : 'tiles: online');
   parts.push(USING.posAPI ? 'pos: API' : (USING.tleLoaded ? 'pos: TLE/fallback' : 'pos: sample'));
-  // show TLE cached age if available
   if(tleCachedAt) {
     const ageMin = Math.round((Date.now() - tleCachedAt)/60000);
     parts.push(`TLE ${ageMin} min`);
@@ -664,7 +765,7 @@ function updateSourceLabel(){
 }
 
 // ---- controls ----
-clearTrackBtn.addEventListener('click', ()=>{ if(!confirm('Clear recorded track?')) return; onlinePoints=[]; offlinePoints=[]; onlineSegments.forEach(s=>map.removeLayer(s)); offlineSegments.forEach(s=>map.removeLayer(s)); onlineSegments=[]; offlineSegments=[]; pointsCountEl.textContent=0; saveTrack(); });
+clearTrackBtn.addEventListener('click', ()=>{ if(!confirm('Clear recorded track?')) return; onlinePoints=[]; offlinePoints=[]; onlineSegments.forEach(s=>map.removeLayer(s)); offlineSegments.forEach(s=>map.removeLayer(s)); onlineSegments=[]; offlineSegments=[]; pointsCountEl.textContent=0; saveTrack(); clearShadowMarkers(); });
 centerBtn.addEventListener('click', ()=>{ const all = onlinePoints.concat(offlinePoints).sort((a,b)=> (a.timestamp||0)-(b.timestamp||0)); if(all.length){ const p = all[all.length-1]; map.setView([p.latitude,p.longitude],4); }});
 
 // ---- main tick ----
@@ -672,7 +773,6 @@ async function tick(){
   const pos = await getPosition();
   pos.timestamp = pos.timestamp || nowUnix();
 
-  // If we switched from offline->online and offline points are far from this api pos, remove offline segments to avoid abstract-crossover
   if(lastSourceWasAPI === false && pos.source === 'API'){
     if(offlinePoints.length){
       const lastOffline = offlinePoints[offlinePoints.length-1];
@@ -689,7 +789,10 @@ async function tick(){
   updatePassInfo();
   updateSourceLabel();
 
-  // pan to latest a bit
+  // update shadow markers (past & future)
+  // keep this non-blocking but we await to reduce races
+  updateShadowMarkers().catch(()=>{});
+
   try{ if(map && pos) map.panTo([pos.latitude,pos.longitude], { animate:true, duration:0.6 }); }catch(e){}
 }
 
